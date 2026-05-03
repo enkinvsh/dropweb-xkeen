@@ -122,10 +122,9 @@ fi
 [ -x /opt/sbin/mihomo ] || die "/opt/sbin/mihomo отсутствует."
 [ -x /opt/sbin/yq ]     || die "/opt/sbin/yq отсутствует."
 
-# --- глушим автозапуск XKeen (чтобы его iptables/policy не вмешивались) ---
+# --- включаем XKeen TPROXY-обвязку (mihomo + iptables connmark hook) ---
 if [ -f /opt/etc/init.d/S99xkeen ]; then
-  sed -i 's/start_auto="on"/start_auto="off"/' /opt/etc/init.d/S99xkeen 2>/dev/null || true
-  /opt/sbin/xkeen -stop >/dev/null 2>&1 || true
+  sed -i 's/start_auto="off"/start_auto="on"/' /opt/etc/init.d/S99xkeen 2>/dev/null || true
 fi
 
 # --- директории/логи ---
@@ -252,11 +251,23 @@ cat > /opt/sbin/mihomo-resume.sh <<'RESUMEEOF'
 #!/opt/bin/sh
 set -eu
 CRON="/opt/var/spool/cron/crontabs/root"
-LINE="13 * * * * /opt/sbin/update-mihomo-sub.sh"
+LINE_UP="13 * * * * /opt/sbin/update-mihomo-sub.sh"
+LINE_WD="* * * * * /opt/sbin/mihomo-watchdog.sh"
+
 rm -f /opt/etc/mihomo/.disabled
+[ -f /opt/etc/init.d/S99xkeen ] && sed -i 's/start_auto="off"/start_auto="on"/' /opt/etc/init.d/S99xkeen
+
 mkdir -p "$(dirname "$CRON")"; touch "$CRON"
-grep -qF "/opt/sbin/update-mihomo-sub.sh" "$CRON" || { printf "%s\n" "$LINE" >> "$CRON"; chmod 600 "$CRON"; /opt/etc/init.d/S10cron restart >/dev/null 2>&1 || true; }
-exec /opt/sbin/mihomo-start.sh
+grep -qF "/opt/sbin/update-mihomo-sub.sh" "$CRON" || printf "%s\n" "$LINE_UP" >> "$CRON"
+grep -qF "/opt/sbin/mihomo-watchdog.sh"   "$CRON" || printf "%s\n" "$LINE_WD" >> "$CRON"
+chmod 600 "$CRON"
+/opt/etc/init.d/S10cron restart >/dev/null 2>&1 || true
+
+# XKeen в полностью отвязанном фоне (он навешает iptables-хук на Policy0 через ~10s)
+nohup /opt/sbin/xkeen -start </dev/null >> /opt/var/log/xkeen-resume.log 2>&1 &
+disown 2>/dev/null || true
+
+echo "resume initiated; mihomo + iptables hook ready in ~10-30s"
 RESUMEEOF
 chmod +x /opt/sbin/mihomo-resume.sh
 ok "/opt/sbin/mihomo-resume.sh"
@@ -429,7 +440,7 @@ ok "/opt/sbin/mihomo-panel.py"
 # =============================================================================
 cat > /opt/etc/init.d/S97mihomo <<'INITMIHEOF'
 #!/opt/bin/sh
-ENABLED=yes
+ENABLED=no
 PROCS=mihomo
 ARGS="-d /opt/etc/mihomo"
 DESC="Mihomo VPN (no-TUN clean SOCKS5)"
@@ -540,10 +551,16 @@ ok "cron: подписка hourly + watchdog ежеминутно"
 # kill switch очищаем (на случай повторной установки)
 rm -f /opt/etc/mihomo/.disabled
 
-# поднимаем mihomo и панель
-inf "Запускаю Mihomo..."
-/opt/etc/init.d/S97mihomo start
-sleep 3
+# поднимаем mihomo через XKeen-обвязку (TPROXY iptables-хук + mihomo)
+inf "Запускаю Mihomo + XKeen TPROXY-обвязку..."
+nohup /opt/sbin/xkeen -start </dev/null >> /opt/var/log/xkeen-install.log 2>&1 &
+disown 2>/dev/null || true
+# даём xkeen время запустить mihomo и навешать iptables connmark-хук
+for _ in 1 2 3 4 5 6 7 8; do
+  sleep 5
+  pidof mihomo >/dev/null 2>&1 && [ "$(iptables -t nat -L PREROUTING -n 2>/dev/null | grep -c xkeen)" = "1" ] && break
+done
+
 inf "Запускаю панель..."
 /opt/etc/init.d/S96mihomo-panel stop 2>/dev/null
 sleep 1
@@ -561,18 +578,28 @@ if [ -n "$panel_pid" ]; then ok "panel:  pid=$panel_pid"; else warn "panel не 
 ver=$(/opt/bin/curl -s --max-time 3 http://127.0.0.1:9090/version 2>/dev/null || echo "")
 [ -n "$ver" ] && ok "API: $ver"
 
+hook=$(iptables -t nat -L PREROUTING -n 2>/dev/null | grep -c xkeen)
+if [ "$hook" = "1" ]; then ok "iptables xkeen TPROXY-хук активен"; else warn "iptables xkeen-хук пока не виден (попробуй через минуту: watchdog поднимет)"; fi
+
 say ""
 say "${C_GRN}=========================================================${C_RST}"
-say "${C_GRN}  Готово.${C_RST}"
+say "${C_GRN}  Готово. Mihomo + XKeen TPROXY работают.${C_RST}"
 say "${C_GRN}=========================================================${C_RST}"
 say ""
-say "  Веб-панель  :  ${C_CYN}http://${LAN_IP}:${PANEL_PORT}/${C_RST}"
-say "  Дашборд     :  ${C_CYN}http://${LAN_IP}:9090/ui/${C_RST}"
-say "  SOCKS5/HTTP :  ${C_CYN}${LAN_IP}:1080${C_RST}"
+say "  ${C_YEL}СЛЕДУЮЩИЙ ШАГ — обязательный:${C_RST}"
+say "  1. Открой ${C_CYN}http://${LAN_IP}/${C_RST} (логин/пароль роутера)"
+say "  2. ${C_CYN}«Список клиентов»${C_RST} → клик на устройство (телик, ПК, телефон)"
+say "  3. В боковой панели ${C_CYN}«Политика доступа»${C_RST} выбрать ${C_CYN}«xkeen»${C_RST} → ${C_CYN}«Сохранить»${C_RST}"
+say "  4. Повторить для каждого устройства, которому нужен VPN"
 say ""
-say "  Аварийная остановка одной командой:"
-say "     ${C_YEL}ssh root@${LAN_IP} /opt/sbin/mihomo-panic.sh${C_RST}"
+say "  Без этого шага трафик НЕ идёт через VPN — устройства работают как обычно."
 say ""
-say "  Удалить:"
-say "     ${C_YEL}/opt/sbin/mihomo-vpn-uninstall.sh${C_RST}"
+say "  Проверка кто в политике:"
+say "     ${C_YEL}ndmc -c \"show running-config\" | grep \"policy Policy0\$\"${C_RST}"
+say ""
+say "  Веб-панель Вкл/Выкл:    ${C_CYN}http://${LAN_IP}:${PANEL_PORT}/${C_RST}"
+say "  Mihomo дашборд:          ${C_CYN}http://${LAN_IP}:9090/ui/${C_RST}"
+say ""
+say "  Аварийная остановка:     ${C_YEL}ssh root@${LAN_IP} /opt/sbin/mihomo-panic.sh${C_RST}"
+say "  Удалить установку:       ${C_YEL}/opt/sbin/mihomo-vpn-uninstall.sh${C_RST}"
 say ""
