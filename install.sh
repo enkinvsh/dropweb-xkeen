@@ -266,32 +266,57 @@ ok "/opt/sbin/mihomo-resume.sh"
 # =============================================================================
 cat > /opt/sbin/mihomo-panic.sh <<'PANICEOF'
 #!/opt/bin/sh
+# Kill switch: останавливает Mihomo, СНИМАЕТ iptables xkeen-хук
+# (важно для TPROXY-режима — иначе устройства Policy0 теряют интернет в мёртвый порт),
+# выключает автозапуск, удаляет cron.
 set +e
+
 DISABLED="/opt/etc/mihomo/.disabled"
 mkdir -p "$(dirname "$DISABLED")"
 echo "[$(date '+%F %T')] PANIC: stopping VPN"
 date "+disabled at %F %T" > "$DISABLED"
-[ -x /opt/etc/init.d/S97mihomo ] && /opt/etc/init.d/S97mihomo stop 2>/dev/null
-/opt/sbin/xkeen -stop 2>/dev/null
-for i in 1 2 3; do
-  pidof mihomo >/dev/null 2>&1 || break
-  killall mihomo 2>/dev/null
+
+# 1. Stop через xkeen в фоне, с тайм-аутом
+( /opt/sbin/xkeen -stop 2>/dev/null ) &
+XK=$!
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  kill -0 $XK 2>/dev/null || break
   sleep 1
 done
+kill -9 $XK 2>/dev/null
+
+# 2. Stop через init.d, если есть
+[ -x /opt/etc/init.d/S97mihomo ] && /opt/etc/init.d/S97mihomo stop 2>/dev/null
+
+# 3. Контроль: добить mihomo
+killall mihomo 2>/dev/null
+sleep 1
 killall -9 mihomo 2>/dev/null
+
+# 4. Гарантированно снять iptables xkeen-хук (для TPROXY-инсталляций)
+iptables -t nat -D PREROUTING -m connmark --mark 0xffffaaa -m conntrack ! --ctstate INVALID -j xkeen 2>/dev/null
+iptables -t nat -F xkeen 2>/dev/null
+
+# 5. Выключить автозапуск xkeen (на случай ребута)
 [ -f /opt/etc/init.d/S99xkeen ] && sed -i 's/start_auto="on"/start_auto="off"/' /opt/etc/init.d/S99xkeen
+
+# 6. Удалить наши cron-задачи (включая watchdog)
 if [ -f /opt/var/spool/cron/crontabs/root ]; then
-  grep -vE "/opt/sbin/(xkeen -ug|update-mihomo-sub\.sh|update-dropweb-mihomo\.sh)" \
+  grep -vE "/opt/sbin/(xkeen -ug|update-mihomo-sub\.sh|update-dropweb-mihomo\.sh|mihomo-watchdog\.sh)" \
     /opt/var/spool/cron/crontabs/root > /tmp/root.cron 2>/dev/null
   mv /tmp/root.cron /opt/var/spool/cron/crontabs/root 2>/dev/null
   chmod 600 /opt/var/spool/cron/crontabs/root 2>/dev/null
 fi
 /opt/etc/init.d/S10cron restart >/dev/null 2>&1
+
+# 7. Снять fwmark-правила от mihomo TUN (если кто-то его включал)
 ip rule | awk -F: '/fwmark/ && $0 !~ /0xffffaaa/ {print $1}' | while read p; do
   [ -n "$p" ] && ip rule del prio "$p" 2>/dev/null
 done
+
 echo "[$(date '+%F %T')] PANIC done"
 echo "mihomo: $(pidof mihomo || echo not running)"
+echo "iptables xkeen hook: $(iptables -t nat -L PREROUTING -n 2>/dev/null | grep -c xkeen) entries"
 echo "kill switch: $DISABLED"
 PANICEOF
 chmod +x /opt/sbin/mihomo-panic.sh
@@ -445,10 +470,10 @@ echo "Останавливаю и удаляю Mihomo VPN установку..."
 /opt/etc/init.d/S96mihomo-panel stop 2>/dev/null
 killall -9 python3 2>/dev/null
 rm -f /opt/etc/init.d/S96mihomo-panel /opt/etc/init.d/S97mihomo
-rm -f /opt/sbin/update-mihomo-sub.sh /opt/sbin/mihomo-start.sh /opt/sbin/mihomo-resume.sh /opt/sbin/mihomo-panic.sh /opt/sbin/mihomo-panel.py
+rm -f /opt/sbin/update-mihomo-sub.sh /opt/sbin/mihomo-start.sh /opt/sbin/mihomo-resume.sh /opt/sbin/mihomo-panic.sh /opt/sbin/mihomo-panel.py /opt/sbin/mihomo-watchdog.sh
 rm -rf /opt/etc/mihomo /opt/backups/mihomo /opt/var/log/mihomo*.log
 if [ -f /opt/var/spool/cron/crontabs/root ]; then
-  grep -vE "/opt/sbin/(update-mihomo-sub\.sh|update-dropweb-mihomo\.sh)" /opt/var/spool/cron/crontabs/root > /tmp/c.cron 2>/dev/null
+  grep -vE "/opt/sbin/(update-mihomo-sub\.sh|update-dropweb-mihomo\.sh|mihomo-watchdog\.sh)" /opt/var/spool/cron/crontabs/root > /tmp/c.cron 2>/dev/null
   mv /tmp/c.cron /opt/var/spool/cron/crontabs/root 2>/dev/null
 fi
 /opt/etc/init.d/S10cron restart 2>/dev/null
@@ -477,15 +502,40 @@ inf "Скачиваю web-UI zashboard..."
 ) || warn "Не смог установить zashboard (это не критично — VPN будет работать без UI)."
 [ -f /opt/etc/mihomo/zash/index.html ] && ok "zashboard установлен" || warn "zashboard пропущен"
 
+# =============================================================================
+# Файл: /opt/sbin/mihomo-watchdog.sh
+# =============================================================================
+cat > /opt/sbin/mihomo-watchdog.sh <<'WATCHEOF'
+#!/opt/bin/sh
+# Поднимает mihomo если он упал. Уважает kill switch (.disabled).
+# Запускать раз в минуту через cron.
+LOG="/opt/var/log/mihomo-watchdog.log"
+DISABLED="/opt/etc/mihomo/.disabled"
+[ -f "$DISABLED" ] && exit 0
+pidof mihomo >/dev/null 2>&1 && exit 0
+echo "[$(date '+%F %T')] mihomo down, reviving" >> "$LOG"
+# Если активна XKeen-обвязка — подымаем через неё (нужно для TPROXY iptables-хуков),
+# иначе — напрямую через наш start.sh.
+if [ -f /opt/etc/init.d/S99xkeen ] && grep -q 'start_auto="on"' /opt/etc/init.d/S99xkeen 2>/dev/null; then
+  nohup /opt/sbin/xkeen -start </dev/null >> "$LOG" 2>&1 &
+else
+  /opt/sbin/mihomo-start.sh >> "$LOG" 2>&1 &
+fi
+disown 2>/dev/null || true
+WATCHEOF
+chmod +x /opt/sbin/mihomo-watchdog.sh
+ok "/opt/sbin/mihomo-watchdog.sh"
+
 # cron
-inf "Ставлю cron на час..."
+inf "Ставлю cron (обновление подписки + watchdog)..."
 touch /opt/var/spool/cron/crontabs/root
-grep -vE "/opt/sbin/update-mihomo-sub.sh" /opt/var/spool/cron/crontabs/root > /tmp/c.cron 2>/dev/null || true
+grep -vE "/opt/sbin/(update-mihomo-sub\.sh|mihomo-watchdog\.sh)" /opt/var/spool/cron/crontabs/root > /tmp/c.cron 2>/dev/null || true
 mv /tmp/c.cron /opt/var/spool/cron/crontabs/root
-printf "13 * * * * /opt/sbin/update-mihomo-sub.sh\n" >> /opt/var/spool/cron/crontabs/root
+printf "13 * * * * /opt/sbin/update-mihomo-sub.sh\n"  >> /opt/var/spool/cron/crontabs/root
+printf "* * * * * /opt/sbin/mihomo-watchdog.sh\n"     >> /opt/var/spool/cron/crontabs/root
 chmod 600 /opt/var/spool/cron/crontabs/root
 /opt/etc/init.d/S10cron restart >/dev/null 2>&1 || true
-ok "cron: 13 * * * * /opt/sbin/update-mihomo-sub.sh"
+ok "cron: подписка hourly + watchdog ежеминутно"
 
 # kill switch очищаем (на случай повторной установки)
 rm -f /opt/etc/mihomo/.disabled
