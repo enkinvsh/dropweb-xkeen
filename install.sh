@@ -12,8 +12,13 @@
 #    4. Ставит/обновляет XKeen 2 и mihomo без вопросов, включает ядро mihomo
 #    5. Собирает конфиг из подписки: TCP через REDIRECT :1182 + UDP через
 #       TPROXY :1181 (listeners), TUN выключен; ставит zashboard (с секретом)
-#    6. Ставит веб-панель «Выключить / Включить VPN», ежечасное обновление
-#       подписки (по содержимому, с горячей перезагрузкой) и watchdog
+#    6. Ставит веб-панель (файлы panel/ из репозитория): VPN вкл/выкл, проверка
+#       связи, срок подписки, «Обновить сейчас», смена ссылки, подсказка с одной
+#       кнопкой, когда подписка упёрлась в лимит устройств или кончилась, и
+#       «Обновить панель» — новая версия панели с GitHub без переустановки
+#    7. Ежечасно обновляет подписку (по содержимому, с горячей перезагрузкой;
+#       если основной адрес недоступен — через запасные из заголовков
+#       подписки) и ставит watchdog
 #
 #  Использование (на роутере по SSH под root):
 #     curl -fsSL -o /tmp/install.sh https://raw.githubusercontent.com/enkinvsh/dropweb-xkeen/main/install.sh
@@ -27,7 +32,7 @@
 
 set -eu
 
-DROPWEB_XKEEN_VERSION="2.0.0"
+DROPWEB_XKEEN_VERSION="2.1.0"
 SCRIPT_VERSION=$DROPWEB_XKEEN_VERSION
 
 # XKeen иначе уходит в фон и сразу возвращает 0 — нам нужен честный код возврата.
@@ -39,6 +44,8 @@ SETTINGS_DIR=/opt/etc/dropweb-xkeen
 SETTINGS_FILE=$SETTINGS_DIR/settings.env
 LEGACY_UPDATER=/opt/sbin/update-mihomo-sub.sh
 LEGACY_PANEL=/opt/sbin/mihomo-panel.py
+PANEL_DIR=/opt/share/dropweb-xkeen/panel
+DEFAULT_PANEL_SOURCE=https://raw.githubusercontent.com/enkinvsh/dropweb-xkeen/main/panel
 XKEEN_INIT=/opt/etc/init.d/S05xkeen
 CONF=/opt/etc/mihomo/config.yaml
 PRECHECK_FILE=/tmp/dropweb-sub-check.$$
@@ -109,6 +116,8 @@ dropweb-xkeen — VPN dropweb на Keenetic через XKeen 2 + mihomo
   API_PORT        порт API и дашборда mihomo (9090)
   API_SECRET      секрет API mihomo (генерируется)
   LAN_IP          адрес роутера в LAN (из br0, иначе 192.168.1.1)
+  PANEL_SOURCE    откуда брать файлы веб-панели и её обновления
+                  (https://raw.githubusercontent.com/enkinvsh/dropweb-xkeen/main/panel)
   ASSUME_YES=1    то же, что -y
 
 Пример:
@@ -153,9 +162,10 @@ ENV_PANEL_PORT=${PANEL_PORT:-}
 ENV_API_PORT=${API_PORT:-}
 ENV_API_SECRET=${API_SECRET:-}
 ENV_LAN_IP=${LAN_IP:-}
+ENV_PANEL_SOURCE=${PANEL_SOURCE:-}
 
 SUB_URL=""; HWID=""; DEVICE_OS=""; OS_VERSION=""; DEVICE_MODEL=""
-USER_AGENT_HDR=""; PANEL_PORT=""; API_PORT=""; API_SECRET=""; LAN_IP=""
+USER_AGENT_HDR=""; PANEL_PORT=""; API_PORT=""; API_SECRET=""; LAN_IP=""; PANEL_SOURCE=""
 
 SETTINGS_ORIGIN="новая установка"
 if [ -f "$SETTINGS_FILE" ]; then
@@ -198,6 +208,7 @@ DROPWEB_XKEEN_VERSION=$SCRIPT_VERSION
 [ -z "$ENV_API_PORT" ]       || API_PORT=$ENV_API_PORT
 [ -z "$ENV_API_SECRET" ]     || API_SECRET=$ENV_API_SECRET
 [ -z "$ENV_LAN_IP" ]         || LAN_IP=$ENV_LAN_IP
+[ -z "$ENV_PANEL_SOURCE" ]   || PANEL_SOURCE=$ENV_PANEL_SOURCE
 
 # $1 байт случайности в hex (не больше 16). busybox od в свежем Entware
 # не знает -A/-t, поэтому берём uuid ядра; od — только запасной путь.
@@ -261,8 +272,11 @@ if [ -z "$LAN_IP" ] && command -v ip >/dev/null 2>&1; then
   LAN_IP=$(ip -4 -o addr show br0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
 fi
 [ -n "$LAN_IP" ]         || LAN_IP="192.168.1.1"
+[ -n "$PANEL_SOURCE" ]   || PANEL_SOURCE=$DEFAULT_PANEL_SOURCE
+PANEL_SOURCE=${PANEL_SOURCE%/}
 
 case "$PANEL_PORT" in ''|*[!0-9]*) die "PANEL_PORT должен быть числом (сейчас: $PANEL_PORT)" ;; esac
+case "$PANEL_SOURCE" in http://?*|https://?*) ;; *) die "PANEL_SOURCE должен быть адресом http(s):// (сейчас: $PANEL_SOURCE)" ;; esac
 case "$API_PORT" in ''|*[!0-9]*) die "API_PORT должен быть числом (сейчас: $API_PORT)" ;; esac
 [ -n "$API_SECRET" ] || die "Не смог сгенерировать секрет API (/dev/urandom недоступен?)"
 
@@ -340,6 +354,7 @@ save_settings() {
       printf 'API_PORT=%s\n' "$(shq "$API_PORT")"
       printf 'API_SECRET=%s\n' "$(shq "$API_SECRET")"
       printf 'LAN_IP=%s\n' "$(shq "$LAN_IP")"
+      printf 'PANEL_SOURCE=%s\n' "$(shq "$PANEL_SOURCE")"
     } >"$ss_tmp"
   )
   chmod 600 "$ss_tmp"
@@ -886,134 +901,34 @@ exit 1
 EOF_RESUME
 }
 
-write_panel() {
-cat >/opt/sbin/mihomo-panel.py <<'EOF_PANEL'
-#!/opt/bin/python3
-# dropweb-xkeen: веб-панель «Выключить / Включить VPN» (python3 stdlib).
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import subprocess, os, json, datetime, re, sys
-
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8181
-PANIC = "/opt/sbin/mihomo-panic.sh"
-START = "/opt/sbin/mihomo-resume.sh"
-CONF = "/opt/etc/mihomo/config.yaml"
-DISABLED = "/opt/etc/mihomo/.disabled"
-XKEEN_INIT = "/opt/etc/init.d/S05xkeen"
-LOG_PATH = "/opt/var/log/mihomo-panel.log"
-RUN_TIMEOUT = 90
-
-def log(msg):
-    try:
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(f"{datetime.datetime.now().isoformat(timespec='seconds')} {msg}\n")
-    except OSError: pass
-
-def mihomo_pid():
-    out = subprocess.run(["pidof","mihomo"], capture_output=True, text=True)
-    return out.stdout.strip() or None
-
-def autostart():
-    try:
-        with open(XKEEN_INIT, encoding="utf-8", errors="replace") as f:
-            return any(re.match(r'\s*start_auto="on"', line) for line in f)
-    except OSError:
-        return False
-
-def updated():
-    try:
-        return datetime.datetime.fromtimestamp(os.path.getmtime(CONF)).strftime("%Y-%m-%d %H:%M")
-    except OSError:
-        return None
-
-PAGE = """<!DOCTYPE html>
-<html lang="ru"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>VPN на роутере</title>
-<style>
-:root{color-scheme:dark;--bg:#0f1115;--card:#181b22;--mut:#8b8f99;--ok:#22c55e;--bad:#ef4444;--warn:#eab308;--btn-bad:#dc2626;--btn-ok:#16a34a;--fg:#e7e9ee}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,system-ui,sans-serif;display:grid;place-items:center;min-height:100dvh;padding:24px}
-.card{background:var(--card);border-radius:24px;padding:32px;max-width:520px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,.4)}
-h1{margin:0 0 8px;font-size:22px;font-weight:600}p.sub{margin:0 0 24px;color:var(--mut);font-size:14px}
-.status{display:flex;align-items:center;gap:12px;padding:16px 20px;background:#222732;border-radius:16px;margin-bottom:24px}
-.dot{width:14px;height:14px;border-radius:50%;flex:0 0 auto;box-shadow:0 0 0 4px rgba(255,255,255,.04)}
-.ok .dot{background:var(--ok);box-shadow:0 0 0 4px rgba(34,197,94,.15)}
-.bad .dot{background:var(--bad);box-shadow:0 0 0 4px rgba(239,68,68,.15)}
-.warn .dot{background:var(--warn);box-shadow:0 0 0 4px rgba(234,179,8,.15)}
-.s-text{font-weight:600;font-size:17px}.s-sub{color:var(--mut);font-size:13px;margin-top:2px}
-.btn{display:block;width:100%;border:0;border-radius:18px;padding:22px;font-size:18px;font-weight:600;color:#fff;cursor:pointer;margin-bottom:12px;transition:transform .04s,filter .15s;font-family:inherit}
-.btn:active{transform:scale(.98)}.btn:hover{filter:brightness(1.08)}
-.btn-bad{background:var(--btn-bad)}.btn-ok{background:var(--btn-ok)}
-.btn:disabled{opacity:.45;cursor:not-allowed;filter:none}
-.hint{color:var(--mut);font-size:13px;line-height:1.55;margin-top:18px;padding-top:18px;border-top:1px solid #262b36}.hint b{color:var(--fg)}
-.toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#262b36;color:#fff;padding:12px 18px;border-radius:12px;font-size:14px;opacity:0;transition:opacity .2s;pointer-events:none;box-shadow:0 12px 30px rgba(0,0,0,.5)}.toast.show{opacity:1}
-</style></head><body>
-<main class="card">
-<h1>VPN на роутере</h1>
-<p class="sub">Если интернет странно работает или сайты не открываются — выключи VPN.</p>
-<div id="status" class="status"><div class="dot"></div>
-<div><div class="s-text" id="s-text">Проверяю…</div><div class="s-sub" id="s-sub">&nbsp;</div></div></div>
-<button id="btn-off" class="btn btn-bad">⛔ Выключить VPN</button>
-<button id="btn-on"  class="btn btn-ok" >✅ Включить VPN</button>
-<p class="hint"><b>Если интернет пропал</b> — нажми «Выключить VPN»: всё пойдёт напрямую, и VPN не включится сам даже после перезагрузки роутера, пока не нажмёшь «Включить». Если эта страница не открывается: <code>ssh root@<span id="router"></span> /opt/sbin/mihomo-panic.sh</code><br><br>
-Эта страница: <code id="addr"></code></p>
-</main>
-<div id="toast" class="toast"></div>
-<script>
-document.getElementById('addr').textContent=location.origin+'/';
-document.getElementById('router').textContent=location.hostname;
-const byId=id=>document.getElementById(id);
-function toast(t){const e=byId('toast');e.textContent=t;e.classList.add('show');setTimeout(()=>e.classList.remove('show'),2500)}
-async function refresh(){
- try{const r=await fetch('/status',{cache:'no-store'});const j=await r.json();
-  const s=byId('status'),txt=byId('s-text'),sub=byId('s-sub'),off=byId('btn-off'),on=byId('btn-on');
-  if(j.running){s.className='status ok';txt.textContent='VPN работает';sub.textContent='mihomo pid '+j.pid+' · подписка обновлена '+(j.updated||'—')}
-  else if(j.disabled){s.className='status bad';txt.textContent='VPN выключен';sub.textContent='Интернет идёт напрямую. Выключение сохранится и после перезагрузки'}
-  else{s.className='status warn';txt.textContent='VPN перезапускается';sub.textContent='Поднимется автоматически в течение минуты'}
-  off.disabled=!!j.disabled;on.disabled=!(j.disabled||!j.running);
- }catch(e){byId('s-text').textContent='Не могу связаться с роутером';byId('s-sub').textContent=String(e)}
-}
-async function action(p,l){if(!confirm(l+'? Подтверди.'))return;toast('Работаю…');
- try{const r=await fetch(p,{method:'POST',headers:{'X-Dropweb-Panel':'1'}});const j=await r.json();toast(j.ok?'Готово':'Ошибка: '+(j.error||'?'))}
- catch(e){toast('Сбой: '+e)}setTimeout(refresh,1500)}
-byId('btn-off').onclick=()=>action('/panic','Выключить VPN');
-byId('btn-on').onclick =()=>action('/resume','Включить VPN');
-refresh();setInterval(refresh,5000);
-</script></body></html>"""
-
-class H(BaseHTTPRequestHandler):
-    def log_message(self,fmt,*a): log("HTTP "+(fmt%a))
-    def _send(self,c,b,t="text/html; charset=utf-8"):
-        d=b.encode() if isinstance(b,str) else b
-        self.send_response(c); self.send_header("Content-Type",t); self.send_header("Content-Length",str(len(d))); self.send_header("Cache-Control","no-store"); self.end_headers(); self.wfile.write(d)
-    def _json(self,c,obj): return self._send(c, json.dumps(obj), "application/json")
-    def _run(self,cmd):
-        if not os.path.exists(cmd): return self._json(500, {"ok":False,"error":"script missing"})
-        try:
-            r=subprocess.run([cmd],capture_output=True,text=True,timeout=RUN_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            return self._json(200, {"ok":False,"error":"timeout"})
-        except OSError as e:
-            return self._json(500, {"ok":False,"error":str(e)})
-        return self._json(200, {"ok":r.returncode==0,"rc":r.returncode,"stdout":r.stdout[-2000:],"stderr":r.stderr[-2000:]})
-    def do_GET(self):
-        path=self.path.split("?",1)[0]
-        if path in ("/","/index.html"): return self._send(200, PAGE)
-        if path == "/status":
-            p=mihomo_pid()
-            return self._json(200, {"running":p is not None,"pid":p,"disabled":os.path.exists(DISABLED),"autostart":autostart(),"updated":updated()})
-        return self._send(404,"not found","text/plain; charset=utf-8")
-    def do_POST(self):
-        path=self.path.split("?",1)[0]
-        if path not in ("/panic","/resume"): return self._send(404,"not found","text/plain; charset=utf-8")
-        # Защита от чужих сайтов: свой заголовок требует CORS preflight, а OPTIONS мы не отвечаем.
-        if self.headers.get("X-Dropweb-Panel") != "1":
-            return self._json(403, {"ok":False,"error":"forbidden"})
-        return self._run(PANIC if path == "/panic" else START)
-
-if __name__ == "__main__":
-    log(f"start on :{PORT}")
-    ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
-EOF_PANEL
+# Панель — отдельные файлы репозитория (panel/): её можно переделывать и обновлять
+# кнопкой в самой панели, не запуская установку. Берём panel/ рядом со скриптом
+# (запуск из клона), иначе качаем из PANEL_SOURCE.
+install_panel() {
+  ip_stage=$PANEL_DIR.new
+  ip_local=""
+  case "$0" in */install.sh) ip_local=${0%/install.sh}/panel ;; install.sh) ip_local=./panel ;; esac
+  if [ -z "$ip_local" ] || [ ! -f "$ip_local/mihomo-panel.py" ] || [ ! -f "$ip_local/index.html" ]; then
+    ip_local=""
+  fi
+  rm -rf "$ip_stage"
+  mkdir -p "$ip_stage" "$PANEL_DIR"
+  for ip_f in mihomo-panel.py index.html; do
+    if [ -n "$ip_local" ]; then
+      cp "$ip_local/$ip_f" "$ip_stage/$ip_f" || return 1
+    else
+      curl -fsSL --connect-timeout 15 --max-time 60 --retry 2 -o "$ip_stage/$ip_f" "$PANEL_SOURCE/$ip_f" 2>>"$INSTALL_LOG" || return 1
+    fi
+  done
+  /opt/bin/python3 -c 'import sys; compile(open(sys.argv[1], "rb").read(), sys.argv[1], "exec")' "$ip_stage/mihomo-panel.py" 2>>"$INSTALL_LOG" || return 1
+  grep -qi '<html' "$ip_stage/index.html" || return 1
+  for ip_f in mihomo-panel.py index.html; do
+    mv -f "$ip_stage/$ip_f" "$PANEL_DIR/$ip_f" || return 1
+  done
+  chmod 755 "$PANEL_DIR/mihomo-panel.py"
+  chmod 644 "$PANEL_DIR/index.html"
+  rm -rf "$ip_stage"
+  PANEL_FROM=${ip_local:-$PANEL_SOURCE}
 }
 
 write_panel_init() {
@@ -1022,7 +937,7 @@ cat >/opt/etc/init.d/S96mihomo-panel <<'EOF_PANEL_INIT'
 # dropweb-xkeen: автозапуск веб-панели. Без rc.func: его stop делает killall python3.
 PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin; export PATH
 PIDFILE=/opt/var/run/mihomo-panel.pid
-PANEL=/opt/sbin/mihomo-panel.py
+PANEL=/opt/share/dropweb-xkeen/panel/mihomo-panel.py
 LOG=/opt/var/log/mihomo-panel.log
 SETTINGS=/opt/etc/dropweb-xkeen/settings.env
 
@@ -1119,7 +1034,7 @@ rm -f /opt/etc/init.d/S96mihomo-panel /opt/etc/init.d/S97mihomo \
   /opt/etc/mihomo/config.yaml /opt/etc/mihomo/.sub.raw.yaml /opt/etc/mihomo/.config.new.yaml \
   /opt/etc/mihomo/.sub.headers \
   /opt/var/run/mihomo-panel.pid
-rm -rf /opt/etc/mihomo/zash /opt/backups/mihomo /opt/etc/dropweb-xkeen
+rm -rf /opt/etc/mihomo/zash /opt/backups/mihomo /opt/etc/dropweb-xkeen /opt/share/dropweb-xkeen
 rm -f /opt/var/log/mihomo-*.log
 
 echo "Готово. XKeen и mihomo оставлены (автозапуск XKeen выключен). Удалить их полностью: xkeen -remove"
@@ -1132,13 +1047,22 @@ write_updater
 write_watchdog
 write_panic
 write_resume
-write_panel
 write_panel_init
 write_uninstall
 chmod +x /opt/sbin/update-mihomo-sub.sh /opt/sbin/mihomo-watchdog.sh /opt/sbin/mihomo-panic.sh \
-  /opt/sbin/mihomo-resume.sh /opt/sbin/mihomo-panel.py /opt/etc/init.d/S96mihomo-panel \
+  /opt/sbin/mihomo-resume.sh /opt/etc/init.d/S96mihomo-panel \
   /opt/sbin/mihomo-vpn-uninstall.sh
 ok "Скрипты в /opt/sbin и /opt/etc/init.d/S96mihomo-panel"
+
+PANEL_FROM=""
+if install_panel; then
+  rm -f "$LEGACY_PANEL"
+  ok "Веб-панель в $PANEL_DIR (из $PANEL_FROM)"
+elif [ -f "$PANEL_DIR/mihomo-panel.py" ]; then
+  warn "Не скачались файлы веб-панели ($PANEL_SOURCE) — оставляю прежнюю версию"
+else
+  warn "Не скачались файлы веб-панели ($PANEL_SOURCE) — VPN работает и без неё; повтори установку позже"
+fi
 
 # =============================================================================
 # Первый конфиг
@@ -1286,7 +1210,10 @@ say ""
 say "  HWID роутера:        $HWID"
 say "                       так роутер виден в боте dropweb как устройство «$DEVICE_MODEL»"
 say ""
-say "  Веб-панель Вкл/Выкл: http://$LAN_IP:$PANEL_PORT/"
+say "  Веб-панель:          http://$LAN_IP:$PANEL_PORT/"
+say "                       VPN вкл/выкл, проверка связи, срок подписки,"
+say "                       «Обновить подписку», смена ссылки, лимит устройств,"
+say "                       «Обновить панель» — новая версия панели с GitHub"
 say "  Дашборд mihomo:      http://$LAN_IP:$API_PORT/ui/"
 say "                       адрес API http://$LAN_IP:$API_PORT, секрет: $API_SECRET"
 say "  Вход в дашборд сразу:"

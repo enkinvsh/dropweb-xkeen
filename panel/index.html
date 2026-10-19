@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="ru"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VPN на роутере</title>
+<style>
+:root{color-scheme:dark;--bg:#0f1115;--card:#181b22;--mut:#8b8f99;--ok:#22c55e;--bad:#ef4444;--warn:#eab308;--btn-bad:#dc2626;--btn-ok:#16a34a;--btn-sec:#2a303c;--line:#262b36;--fg:#e7e9ee}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,system-ui,sans-serif;display:grid;place-items:center;min-height:100dvh;padding:24px}
+.card{background:var(--card);border-radius:24px;padding:32px;max-width:520px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,.4)}
+h1{margin:0 0 8px;font-size:22px;font-weight:600}p.sub{margin:0 0 24px;color:var(--mut);font-size:14px}
+.status{display:flex;align-items:center;gap:12px;padding:16px 20px;background:#222732;border-radius:16px;margin-bottom:12px}
+.status+.status{margin-bottom:24px}
+.dot{width:14px;height:14px;border-radius:50%;flex:0 0 auto;background:var(--mut);box-shadow:0 0 0 4px rgba(255,255,255,.04)}
+.ok .dot{background:var(--ok);box-shadow:0 0 0 4px rgba(34,197,94,.15)}
+.bad .dot{background:var(--bad);box-shadow:0 0 0 4px rgba(239,68,68,.15)}
+.warn .dot{background:var(--warn);box-shadow:0 0 0 4px rgba(234,179,8,.15)}
+.s-text{font-weight:600;font-size:17px}.s-sub{color:var(--mut);font-size:13px;margin-top:2px}
+.alert{padding:18px 20px;border-radius:16px;margin:-8px 0 24px;background:rgba(239,68,68,.10);border:1px solid rgba(239,68,68,.35)}
+.alert.warn{background:rgba(234,179,8,.08);border-color:rgba(234,179,8,.35)}
+.alert b{display:block;font-size:16px;margin-bottom:4px}.alert p{margin:0;font-size:14px;line-height:1.55;color:#cfd3db}
+.alert .btn{margin:14px 0 0;text-decoration:none;text-align:center;padding:16px;font-size:16px}
+.out{font-size:14px;line-height:1.55;padding:14px 18px;border-radius:14px;background:#222732;margin:0 0 12px}
+.btn{display:block;width:100%;border:0;border-radius:18px;padding:22px;font-size:18px;font-weight:600;color:#fff;cursor:pointer;margin-bottom:12px;transition:transform .04s,filter .15s;font-family:inherit}
+.btn:active{transform:scale(.98)}.btn:hover{filter:brightness(1.08)}
+.btn-bad{background:var(--btn-bad)}.btn-ok{background:var(--btn-ok)}.btn-sec{background:var(--btn-sec)}
+.btn:disabled{opacity:.45;cursor:not-allowed;filter:none}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.row .btn{font-size:16px;padding:18px 10px}
+details{border-top:1px solid var(--line);margin-top:6px;padding-top:16px}
+summary{cursor:pointer;font-size:15px;font-weight:600;list-style:none}summary::-webkit-details-marker{display:none}
+summary::after{content:"  ›";color:var(--mut)}details[open] summary::after{content:"  ⌄"}
+details p{color:var(--mut);font-size:13px;line-height:1.55;margin:10px 0 12px}
+input{width:100%;padding:14px 16px;border-radius:14px;border:1px solid var(--line);background:#11141a;color:var(--fg);font:inherit;font-size:15px;margin-bottom:12px}
+input:focus{outline:2px solid #3b82f6;outline-offset:1px}
+code{word-break:break-all}a{color:#60a5fa}
+.hint{color:var(--mut);font-size:13px;line-height:1.55;margin-top:18px;padding-top:18px;border-top:1px solid var(--line)}.hint b{color:var(--fg)}
+.toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#262b36;color:#fff;padding:12px 18px;border-radius:12px;font-size:14px;opacity:0;transition:opacity .2s;pointer-events:none;box-shadow:0 12px 30px rgba(0,0,0,.5);max-width:calc(100vw - 32px);text-align:center}.toast.show{opacity:1}
+[hidden]{display:none!important}
+@media (max-width:420px){body{padding:12px}.card{padding:24px 18px}.row{grid-template-columns:1fr;gap:0}}
+</style></head><body>
+<main class="card">
+<h1>VPN на роутере</h1>
+<p class="sub">Если сайты не открываются или интернет странно работает — нажми «Проверить связь».</p>
+<div id="status" class="status"><div class="dot"></div>
+<div><div class="s-text" id="s-text">Проверяю…</div><div class="s-sub" id="s-sub">&nbsp;</div></div></div>
+<div id="sub" class="status"><div class="dot"></div>
+<div><div class="s-text" id="sub-text">Подписка…</div><div class="s-sub" id="sub-sub">&nbsp;</div></div></div>
+<div id="alert" class="alert" hidden><b id="al-title"></b><p id="al-text"></p><a id="al-btn" class="btn btn-ok" target="_blank" rel="noopener" hidden></a></div>
+<div id="out" class="out" hidden></div>
+<div class="row"><button id="btn-chk" class="btn btn-sec">Проверить связь</button><button id="btn-upd" class="btn btn-sec">Обновить подписку</button></div>
+<button id="btn-off" class="btn btn-bad">⛔ Выключить VPN</button>
+<button id="btn-on"  class="btn btn-ok" >✅ Включить VPN</button>
+<details id="more"><summary>Сменить ссылку на подписку</summary>
+<p>Нужно, если купил новую подписку или старая ссылка перестала открываться. Ссылка — в боте dropweb или в личном кабинете. Сейчас: <code id="cur-link">—</code></p>
+<input id="link" type="url" inputmode="url" placeholder="https://…" autocomplete="off" autocapitalize="off" spellcheck="false">
+<button id="btn-link" class="btn btn-sec">Сохранить и проверить</button>
+</details>
+<details id="about"><summary>Обновить панель</summary>
+<p>Сейчас версия <b id="ver">—</b>. Новый вид и возможности этой страницы выходят на GitHub: кнопка скачает последнюю версию, проверит её и перезапустит страницу. VPN и интернет при этом не прерываются.</p>
+<button id="btn-panel" class="btn btn-sec">Скачать и поставить</button>
+</details>
+<p class="hint"><b>Если интернет пропал</b> — нажми «Выключить VPN»: всё пойдёт напрямую, и VPN не включится сам даже после перезагрузки роутера, пока не нажмёшь «Включить». Если эта страница не открывается: <code>ssh root@<span id="router"></span> /opt/sbin/mihomo-panic.sh</code><span id="cab" hidden><br><br><a id="cab-a" target="_blank" rel="noopener">Личный кабинет dropweb</a> — оплата и устройства.</span><br><br>
+Эта страница: <code id="addr"></code></p>
+</main>
+<div id="toast" class="toast"></div>
+<script>
+const $=id=>document.getElementById(id);
+$('addr').textContent=location.origin+'/';
+$('router').textContent=location.hostname;
+let busy=false,recheck=false,last=null;
+const DAY=86400;
+const MSG={updated:'Подписка обновлена',unchanged:'Подписка актуальна — менять нечего',
+ device_limit:'Все места для устройств заняты',stub:'Сервис не принял роутер',
+ fetch_failed:'Подписка не скачалась — сайт подписки недоступен',not_config:'По ссылке не подписка dropweb',
+ bad_config:'Новая версия подписки не подошла',busy:'Роутер уже занят — подожди минуту',
+ timeout:'Не дождался ответа — попробуй ещё раз',error:'Что-то пошло не так — попробуй ещё раз',
+ bad_url:'Ссылка должна начинаться с https://'};
+const dDate=s=>new Date(s*1000).toLocaleDateString('ru-RU',{day:'numeric',month:'long',year:'numeric'});
+const dTime=s=>new Date(s*1000).toLocaleString('ru-RU',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'});
+function toast(t){const e=$('toast');e.textContent=t;e.classList.add('show');clearTimeout(e._t);e._t=setTimeout(()=>e.classList.remove('show'),4000)}
+function card(id,cls,title,sub){$(id).className='status '+cls;$(id==='sub'?'sub-text':'s-text').textContent=title;$(id==='sub'?'sub-sub':'s-sub').textContent=sub}
+function alertBox(kind,title,text,btn,href){const a=$('alert'),b=$('al-btn');
+ if(!title){a.hidden=true;return}
+ a.hidden=false;a.className='alert'+(kind==='warn'?' warn':'');$('al-title').textContent=title;$('al-text').textContent=text;
+ if(btn&&href){b.hidden=false;b.textContent=btn;b.href=href}else b.hidden=true}
+function render(j){
+ last=j;
+ if(j.running)card('status','ok','VPN работает','Российские сайты идут напрямую, остальное — через VPN');
+ else if(j.disabled)card('status','bad','VPN выключен','Интернет идёт напрямую. Выключение сохранится и после перезагрузки');
+ else card('status','warn','VPN перезапускается','Поднимется автоматически в течение минуты');
+ const lock=busy||j.busy;
+ $('btn-off').disabled=lock||!!j.disabled;$('btn-on').disabled=lock||!(j.disabled||!j.running);
+ $('btn-upd').disabled=lock;$('btn-link').disabled=lock;$('btn-panel').disabled=lock;
+ $('ver').textContent=j.panel||'—';
+ const u=j.sub||{},now=Date.now()/1000;
+ $('cur-link').textContent=u.link||'—';
+ $('cab').hidden=!u.cabinet_url;if(u.cabinet_url)$('cab-a').href=u.cabinet_url;
+ const exp=u.expire>0?u.expire:null,left=exp?Math.ceil((exp-now)/DAY):null,expired=!!exp&&exp<now;
+ const when=(u.last_ok?'Обновлена '+dTime(u.last_ok):'Ещё ни разу не скачалась')+(u.via_mirror?' · через запасной адрес':'');
+ if(expired)card('sub','bad','Подписка закончилась '+dDate(exp),'Продли её — VPN заработает после обновления');
+ else if(exp&&left<=3)card('sub','warn','Подписка до '+dDate(exp),'Осталось дней: '+left+' — пора продлить');
+ else if(exp)card('sub',u.result==='device_limit'?'bad':'ok','Подписка до '+dDate(exp),when);
+ else if(u.result)card('sub',u.last_ok?'ok':'warn',u.last_ok?'Подписка подключена':'Подписка не подключена',when);
+ else card('sub','warn','Подписка ещё не проверялась','Нажми «Обновить подписку»');
+ const ann=(u.result!=='updated'&&u.result!=='unchanged'&&u.announce)?' '+u.announce:'';
+ if(u.result==='device_limit')alertBox('bad','Все места для устройств заняты','Роутер не может обновить подписку. Удали в кабинете старые устройства и вернись на эту страницу — роутер проверит сам.'+ann,'Освободить место',u.devices_url||u.cabinet_url);
+ else if(expired)alertBox('bad','Подписка закончилась','Оплати подписку в личном кабинете или в боте dropweb и вернись сюда — роутер обновит подписку сам.','Продлить подписку',u.cabinet_url);
+ else if(u.result==='stub')alertBox('bad','Сервис не принял роутер','Вместо подписки пришла заглушка.'+ann+' Напиши в поддержку dropweb.','Личный кабинет',u.cabinet_url);
+ else if(u.result==='not_config')alertBox('bad','По ссылке не подписка','Похоже, ссылка неправильная. Возьми новую в боте dropweb и вставь её ниже, в «Сменить ссылку на подписку».');
+ else if(u.result==='fetch_failed')alertBox('warn','Подписка не скачалась','Сайт подписки сейчас недоступен. VPN работает на последней сохранённой версии, роутер повторит сам через час.');
+ else if(u.result==='bad_config')alertBox('warn','Новая версия подписки не подошла','VPN работает на прошлой версии. Если так больше суток — напиши в поддержку dropweb.');
+ else alertBox();
+}
+async function refresh(){
+ try{const r=await fetch('/status',{cache:'no-store'});render(await r.json())}
+ catch(e){$('s-text').textContent='Не могу связаться с роутером';$('s-sub').textContent=String(e)}
+}
+async function post(p,body){
+ const r=await fetch(p,{method:'POST',headers:{'X-Dropweb-Panel':'1','Content-Type':'application/json'},body:JSON.stringify(body||{})});
+ return r.json();
+}
+function hold(on,btn,label){busy=on;if(on){btn.dataset.l=btn.textContent;btn.textContent=label}else if(btn.dataset.l){btn.textContent=btn.dataset.l}if(last)render(last)}
+async function update(auto){
+ const b=$('btn-upd'),was=last&&last.sub?last.sub.result:'';hold(true,b,'Обновляю…');
+ try{const j=await post('/update');
+  toast(j.ok&&auto&&was==='device_limit'?'Готово: роутер снова получил подписку':(MSG[j.result]||MSG.error))}
+ catch(e){toast('Сбой: '+e)}
+ finally{hold(false,b);refresh()}
+}
+async function check(){
+ const b=$('btn-chk'),o=$('out');hold(true,b,'Проверяю…');o.hidden=false;o.textContent='Проверяю интернет и VPN-сервер…';
+ try{const j=await post('/check');
+  if(!j.direct.ok)o.textContent='У роутера нет интернета. Это не VPN: проверь кабель и роутер провайдера.';
+  else if(!j.running)o.textContent='Интернет есть. VPN сейчас выключен — заблокированные сайты работать не будут.';
+  else if(!j.vpn||!j.vpn.ok)o.textContent='Интернет есть, но VPN-сервер не отвечает. Нажми «Обновить подписку». Если сайты всё равно не открываются — выключи VPN и напиши в поддержку dropweb.';
+  else o.textContent='Всё в порядке: интернет есть, VPN-сервер отвечает за '+j.vpn.ms+' мс.'}
+ catch(e){o.textContent='Сбой проверки: '+e}
+ finally{hold(false,b)}
+}
+async function action(p,l){
+ if(!confirm(l+'? Подтверди.'))return;
+ const b=p==='/panic'?$('btn-off'):$('btn-on');hold(true,b,'Работаю…');
+ try{const j=await post(p);toast(j.ok?'Готово':(j.result==='busy'?MSG.busy:'Ошибка: '+(j.error||'?')))}
+ catch(e){toast('Сбой: '+e)}
+ finally{hold(false,b);setTimeout(refresh,800)}
+}
+async function saveLink(){
+ const v=$('link').value.trim();
+ if(!/^https:\/\/\S+$/.test(v)){toast(MSG.bad_url);return}
+ const b=$('btn-link');hold(true,b,'Проверяю ссылку…');
+ try{const j=await post('/link',{url:v});
+  if(j.ok){toast('Ссылка сохранена, подписка обновлена');$('link').value='';$('more').open=false}
+  else toast((j.reverted?'Ссылка не подошла, оставил прежнюю. ':'')+(MSG[j.result]||MSG.error))}
+ catch(e){toast('Сбой: '+e)}
+ finally{hold(false,b);refresh()}
+}
+const PMSG={same:'У тебя уже последняя версия панели',
+ fetch_failed:'Не смог скачать панель с GitHub — проверь интернет и попробуй позже',
+ bad_files:'Скачанная версия повреждена — оставил текущую',
+ test_failed:'Новая версия не запустилась — оставил текущую',busy:MSG.busy};
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+// Панель перезапускается в новую версию: старый процесс ещё ~0,5 с отвечает, потом порт пуст.
+async function panelBack(){await sleep(1500);for(let i=0;i<30;i++){try{if((await fetch('/status',{cache:'no-store'})).ok)return}catch(e){}await sleep(1000)}}
+async function panelUpdate(){
+ const b=$('btn-panel');hold(true,b,'Скачиваю…');
+ try{const j=await post('/panel-update');
+  if(j.result==='updated'){b.textContent='Перезапускаю…';sessionStorage.setItem('panelUpdated',j.version||'');await panelBack();location.reload();return}
+  toast(PMSG[j.result]||MSG.error)}
+ catch(e){toast('Сбой: '+e)}
+ hold(false,b);refresh()
+}
+$('btn-off').onclick=()=>action('/panic','Выключить VPN');
+$('btn-on').onclick=()=>action('/resume','Включить VPN');
+$('btn-upd').onclick=()=>update(false);
+$('btn-chk').onclick=check;
+$('btn-link').onclick=saveLink;
+$('btn-panel').onclick=panelUpdate;
+const pu=sessionStorage.getItem('panelUpdated');
+if(pu!==null){sessionStorage.removeItem('panelUpdated');toast('Панель обновлена'+(pu?' до версии '+pu:''))}
+// Ушёл в кабинет освобождать место или платить — по возвращении проверяем сами.
+$('al-btn').addEventListener('click',()=>{recheck=true});
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&recheck&&!busy){recheck=false;update(true)}});
+refresh();setInterval(refresh,5000);
+</script></body></html>
