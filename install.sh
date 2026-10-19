@@ -471,17 +471,21 @@ mkdir -p /opt/etc/mihomo /opt/backups/mihomo /opt/var/run /opt/etc/init.d /opt/s
 write_updater() {
 cat >/opt/sbin/update-mihomo-sub.sh <<'EOF_UPDATER'
 #!/opt/bin/sh
-# dropweb-xkeen: обновление подписки (cron раз в час).
+# dropweb-xkeen: обновление подписки (cron раз в час и кнопка в веб-панели).
 # Коды выхода: 0 ок/без изменений, 1 не скачалось, 2 заглушка/не конфиг mihomo,
-# 3 mihomo -t не принял конфиг, 4 нет settings.env.
+# 3 mihomo -t не принял конфиг, 4 нет settings.env, 5 уже идёт другое обновление.
+# Итог каждого запуска пишется в sub-state.env: по нему панель объясняет
+# человеку без SSH, что случилось (лимит устройств, срок оплаты, сайт недоступен).
 set -u
 PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin; export PATH
 export XKEEN_FOREGROUND=1
 
 SETTINGS=/opt/etc/dropweb-xkeen/settings.env
+STATE=/opt/etc/dropweb-xkeen/sub-state.env
 CONF_DIR=/opt/etc/mihomo
 CONF=$CONF_DIR/config.yaml
 RAW=$CONF_DIR/.sub.raw.yaml
+HDR=$CONF_DIR/.sub.headers
 TMP=$CONF_DIR/.config.new.yaml
 BACKUP_DIR=/opt/backups/mihomo
 LOG=/opt/var/log/mihomo-sub-update.log
@@ -503,40 +507,135 @@ fi
 : "${SUB_URL:=}" "${HWID:=}" "${DEVICE_OS:=KeeneticOS}" "${OS_VERSION:=}" "${DEVICE_MODEL:=Keenetic Router}"
 : "${USER_AGENT_HDR:=clash.meta}" "${API_PORT:=9090}" "${API_SECRET:=}"
 
+# Значения из заголовков сервиса — в одинарных кавычках: файл читается через «.».
+shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+SUB_STATE_URL=""; SUB_RESULT=""; SUB_RESULT_AT=""; SUB_LAST_OK=""; SUB_USED_URL=""
+SUB_EXPIRE=""; SUB_MIRRORS=""; SUB_DEVICES_URL=""; SUB_CABINET_URL=""; SUB_ANNOUNCE=""
+if [ -f "$STATE" ]; then
+  # shellcheck source=/dev/null
+  . "$STATE"
+fi
+# Зеркала и срок оплаты принадлежат конкретной подписке: ссылку сменили — забываем.
+if [ "$SUB_STATE_URL" != "$SUB_URL" ]; then
+  SUB_RESULT=""; SUB_RESULT_AT=""; SUB_LAST_OK=""; SUB_USED_URL=""
+  SUB_EXPIRE=""; SUB_MIRRORS=""; SUB_DEVICES_URL=""; SUB_CABINET_URL=""; SUB_ANNOUNCE=""
+fi
+SUB_STATE_URL=$SUB_URL
+
+save_state() {
+  st_tmp="$STATE.tmp.$$"
+  (
+    umask 077
+    {
+      printf '# dropweb-xkeen: итог последнего обновления подписки (пишет update-mihomo-sub.sh, читает панель)\n'
+      printf 'SUB_STATE_URL=%s\n' "$(shq "$SUB_STATE_URL")"
+      printf 'SUB_RESULT=%s\n' "$(shq "$SUB_RESULT")"
+      printf 'SUB_RESULT_AT=%s\n' "$(shq "$SUB_RESULT_AT")"
+      printf 'SUB_LAST_OK=%s\n' "$(shq "$SUB_LAST_OK")"
+      printf 'SUB_USED_URL=%s\n' "$(shq "$SUB_USED_URL")"
+      printf 'SUB_EXPIRE=%s\n' "$(shq "$SUB_EXPIRE")"
+      printf 'SUB_MIRRORS=%s\n' "$(shq "$SUB_MIRRORS")"
+      printf 'SUB_DEVICES_URL=%s\n' "$(shq "$SUB_DEVICES_URL")"
+      printf 'SUB_CABINET_URL=%s\n' "$(shq "$SUB_CABINET_URL")"
+      printf 'SUB_ANNOUNCE=%s\n' "$(shq "$SUB_ANNOUNCE")"
+    } >"$st_tmp"
+  ) && mv "$st_tmp" "$STATE"
+}
+# finish <итог для панели> <код выхода>
+finish() {
+  SUB_RESULT=$1
+  SUB_RESULT_AT=$(date +%s)
+  save_state
+  exit "$2"
+}
+
+# Значение заголовка ответа (последнее, имя без учёта регистра).
+hdr_get() {
+  awk -v k="$1" 'BEGIN{k=tolower(k)} {sub(/\r$/,""); i=index($0,":"); if(i>1 && tolower(substr($0,1,i-1))==k){v=substr($0,i+1); sub(/^[ \t]+/,"",v); val=v}} END{printf "%s", val}' "$HDR" 2>/dev/null
+}
+url_host() { uh=${1#https://}; printf '%s' "${uh%%/*}"; }
+
 # Блокировка без вечных хвостов: чужой lock снимаем, если его процесс умер.
+# Код 5 нужен панели: «уже обновляется» — не то же самое, что «без изменений».
 if ! mkdir "$LOCK" 2>/dev/null; then
   p=$(cat "$LOCK/pid" 2>/dev/null)
-  [ -n "$p" ] && kill -0 "$p" 2>/dev/null && exit 0
-  rm -rf "$LOCK"; mkdir "$LOCK" 2>/dev/null || exit 0
+  if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+    echo "уже идёт обновление (pid $p)" >&2
+    exit 5
+  fi
+  rm -rf "$LOCK"; mkdir "$LOCK" 2>/dev/null || exit 5
 fi
 echo $$ >"$LOCK/pid"
-trap 'rm -rf "$LOCK" "$RAW" "$TMP"' EXIT
+trap 'rm -rf "$LOCK" "$RAW" "$TMP" "$HDR"' EXIT
 trap 'exit 1' INT TERM
 
-# 1. Скачать
+# 1. Скачать: своя ссылка, затем зеркала из прошлого ответа сервиса.
+# Домен подписки в РФ могут заблокировать (так было с *.dropweb.org),
+# а зеркала сервис присылает в заголовках самой подписки.
 set -- -H "x-hwid: $HWID" -H "x-device-os: $DEVICE_OS"
 if [ -n "$OS_VERSION" ]; then set -- "$@" -H "x-ver-os: $OS_VERSION"; fi
 set -- "$@" -H "x-device-model: $DEVICE_MODEL" -A "$USER_AGENT_HDR"
-if ! curl -fsS --connect-timeout 15 --max-time 90 --retry 2 --retry-delay 5 "$@" -o "$RAW" "$SUB_URL" 2>>"$LOG"; then
-  log "ERR: подписка не скачалась; текущий конфиг не трогаю"
-  exit 1
-fi
 
-# 2. Заглушка вместо подписки (лимит устройств / HWID не принят)
-if grep -qE 'Приложение не поддерживается|превысили лимит|00000000-0000-0000-0000-000000000000' "$RAW"; then
-  log "ERR: заглушка (лимит устройств/HWID)"
-  exit 2
+# fetch_from <url> <повторы> <заголовки curl...>
+fetch_from() {
+  ff_url=$1; ff_retry=$2; shift 2
+  rm -f "$RAW" "$HDR"
+  curl -fsS --connect-timeout 15 --max-time 90 --retry "$ff_retry" --retry-delay 5 "$@" -D "$HDR" -o "$RAW" "$ff_url" 2>>"$LOG"
+}
+
+used=""
+if fetch_from "$SUB_URL" 2 "$@"; then
+  used=$SUB_URL
+else
+  log "WARN: основная ссылка ($(url_host "$SUB_URL")) не скачалась — пробую зеркала"
+  # Зеркала без повторов: заблокированный домен иначе съест минуты на каждом.
+  for u in $(printf '%s' "$SUB_MIRRORS" | tr ',' ' '); do
+    [ "$u" != "$SUB_URL" ] || continue
+    case "$u" in https://*) ;; *) continue ;; esac
+    if fetch_from "$u" 0 "$@"; then
+      used=$u
+      log "скачал с зеркала $(url_host "$u")"
+      break
+    fi
+  done
 fi
+if [ -z "$used" ]; then
+  log "ERR: подписка не скачалась; текущий конфиг не трогаю"
+  finish fetch_failed 1
+fi
+SUB_USED_URL=$used
+
+# 2. Что сервис сообщил о подписке. Берём и из заглушки: в ней ссылка на устройства.
+hv=$(hdr_get subscription-userinfo | sed -n 's/.*expire=\([0-9][0-9]*\).*/\1/p')
+[ -z "$hv" ] || SUB_EXPIRE=$hv
+SUB_DEVICES_URL=$(hdr_get dropweb-device-remove)
+SUB_CABINET_URL=$(hdr_get dropweb-cabinet | cut -d, -f1 | tr -d ' ')
+SUB_ANNOUNCE=$(hdr_get announce)
+hm=$(printf '%s,%s' "$(hdr_get dropweb-sub-mirrors)" "$(hdr_get fallback-url)" \
+  | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep '^https://' \
+  | awk '!seen[$0]++' | tr '\n' ',' | sed 's/,$//')
+[ -z "$hm" ] || SUB_MIRRORS=$hm
+
+# 3. Не конфиг mihomo (страница ошибки, не та ссылка)
 if ! yq -e '((.proxies // []) | length) > 0' "$RAW" >/dev/null 2>&1; then
   log "ERR: в подписке нет proxies — это не конфиг mihomo"
-  exit 2
-fi
-if ! yq -e '[(.proxies // [])[] | select(.server == "0.0.0.0")] | length == 0' "$RAW" >/dev/null 2>&1; then
-  log "ERR: заглушка (сервер 0.0.0.0)"
-  exit 2
+  finish not_config 2
 fi
 
-# 3. Наши правки поверх шаблона dropweb.
+# 4. Заглушка вместо подписки. Лимит отличаем от прочих заглушек по
+# x-hwid-max-devices-reached: true (2026-10-19 так ответила живая панель dropweb).
+if grep -qE 'Приложение не поддерживается|превысили лимит|лимит устройств|00000000-0000-0000-0000-000000000000' "$RAW" \
+  || ! yq -e '[(.proxies // [])[] | select(.server == "0.0.0.0")] | length == 0' "$RAW" >/dev/null 2>&1; then
+  if [ "$(hdr_get x-hwid-max-devices-reached)" = "true" ] || grep -qE 'превысили лимит|лимит устройств' "$RAW"; then
+    log "ERR: заглушка — все места для устройств заняты (HWID $HWID); текущий конфиг не трогаю"
+    finish device_limit 2
+  fi
+  log "ERR: заглушка — сервис не принял HWID $HWID; текущий конфиг не трогаю"
+  finish stub 2
+fi
+
+# 5. Наши правки поверх шаблона dropweb.
 # В шаблоне allow-lan: false, а с ним redir-port/tproxy-port слушают только
 # 127.0.0.1 — REDIRECT приходит на LAN-адрес и отбивается. Записи listeners
 # слушают 0.0.0.0 независимо от allow-lan, поэтому порты XKeen задаём там.
@@ -561,22 +660,23 @@ del(."tproxy-port") | del(."redir-port") |
 '
 if ! { cp "$RAW" "$TMP" && yq -i "$EXPR" "$TMP"; } >>"$LOG" 2>&1; then
   log "ERR: yq не смог применить правки — это не конфиг mihomo"
-  exit 2
+  finish not_config 2
 fi
 
-# 4. Проверка mihomo
+# 6. Проверка mihomo
 if ! mihomo -t -d "$CONF_DIR" -f "$TMP" >>"$LOG" 2>&1; then
   log "ERR: mihomo -t не принял конфиг; текущий не трогаю"
-  exit 3
+  finish bad_config 3
 fi
 
-# 5. Сравнение всего содержимого (не только имён нод)
+# 7. Сравнение всего содержимого (не только имён нод)
+SUB_LAST_OK=$(date +%s)
 if [ -f "$CONF" ] && cmp -s "$TMP" "$CONF"; then
   log "без изменений"
-  exit 0
+  finish unchanged 0
 fi
 
-# 6. Бэкап и замена
+# 8. Бэкап и замена
 if [ -f "$CONF" ]; then
   cp "$CONF" "$BACKUP_DIR/config.yaml.$(date '+%Y%m%d-%H%M%S').bak"
 fi
@@ -586,7 +686,7 @@ mv "$TMP" "$CONF"
 chmod 600 "$CONF"
 log "конфиг обновлён"
 
-# 7. Горячая перезагрузка без обрыва соединений
+# 9. Горячая перезагрузка без обрыва соединений
 if pidof mihomo >/dev/null 2>&1 && [ ! -f "$CONF_DIR/.disabled" ]; then
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X PUT \
     -H "Content-Type: application/json" \
@@ -603,7 +703,7 @@ if pidof mihomo >/dev/null 2>&1 && [ ! -f "$CONF_DIR/.disabled" ]; then
   esac
 fi
 
-exit 0
+finish updated 0
 EOF_UPDATER
 }
 
@@ -1017,6 +1117,7 @@ rm -f /opt/etc/init.d/S96mihomo-panel /opt/etc/init.d/S97mihomo \
   /opt/sbin/update-mihomo-sub.sh /opt/sbin/mihomo-start.sh /opt/sbin/mihomo-resume.sh /opt/sbin/mihomo-panic.sh \
   /opt/sbin/mihomo-panel.py /opt/sbin/mihomo-watchdog.sh \
   /opt/etc/mihomo/config.yaml /opt/etc/mihomo/.sub.raw.yaml /opt/etc/mihomo/.config.new.yaml \
+  /opt/etc/mihomo/.sub.headers \
   /opt/var/run/mihomo-panel.pid
 rm -rf /opt/etc/mihomo/zash /opt/backups/mihomo /opt/etc/dropweb-xkeen
 rm -f /opt/var/log/mihomo-*.log
