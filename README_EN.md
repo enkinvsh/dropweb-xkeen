@@ -9,18 +9,40 @@ A single script turns a Keenetic router with Entware into a **transparent VPN ro
 ## What You Get
 
 - **Transparent VPN for selected devices** via [XKeen 2](https://github.com/jameszeroX/XKeen) + **mihomo** (Clash.Meta) with dropweb routing rules: both TCP and UDP from devices in the policy are intercepted at the router
-- **Web toggle panel ("Disable / Enable VPN")** at `http://192.168.1.1:8181/` — no SSH required for daily control
+- **Web panel** at `http://192.168.1.1:8181/` — no SSH for daily use: VPN on/off, connection check, subscription expiry, "Update subscription", change the subscription link. When the subscription hits its device limit or expires, the panel says so and offers the one button that fixes it
 - **Zashboard UI** at `http://192.168.1.1:9090/ui/` — nodes, active connections, logs, latency checks. Protected by an API secret
-- **Hourly subscription sync** — full config diffing with hot reload via the mihomo API (zero connection drops when changed)
+- **Hourly subscription sync** — full config diffing with hot reload via the mihomo API (zero connection drops when changed). If the primary subscription address is unreachable, the router falls back to the mirror addresses dropweb sends in the subscription itself
 - **Watchdog** — automatically restarts mihomo within a minute if the process crashes
 - **One-click / one-command emergency bypass** — and the VPN **stays disabled across router reboots** until explicitly re-enabled
 
 ## Requirements
 
 1. **Keenetic router** running KeeneticOS 4+ with Entware support (Giga, Ultra, Hopper, Sprinter, Peak, etc.)
-2. **Entware/OPKG** installed on a USB drive (Keenetic web UI → Applications → install OPKG → reboot router)
-3. **Root SSH access** to Entware (default: `root@192.168.1.1`, password `keenetic`)
-4. **Subscription URL from the dropweb bot** — current gateway link (`https://….apigw.yandexcloud.net/…`)
+2. **Entware on a USB drive** — see [Entware from scratch](#entware-from-scratch)
+3. **Root SSH access** to Entware (default: `root@192.168.1.1`, password `keenetic` — change it right after setup)
+4. **Subscription URL from the dropweb bot** (`https://dropweb.site/s/…`). If the installer says the subscription could not be downloaded, get a fresh link from the bot
+
+### Entware from scratch
+
+The "OPKG" component in the web UI only enables package support — it does **not** install Entware. Working sequence (the USB drive gets wiped):
+
+1. Keenetic web UI → firmware components → install **Open Package support** (OPKG), the **Ext file system**, and both **Netfilter kernel module** entries (XKeen needs them). The router reboots
+2. Plug in the USB drive → open it on the USB storage page → **initialize / format as EXT4** (Keenetic creates a swap partition plus EXT4). Note the EXT4 partition label, e.g. `EXT4-9jgJCLGS`
+3. Open the router CLI at `http://192.168.1.1/a` and run one command — label from step 2, installer URL for your architecture:
+
+   ```text
+   opkg disk EXT4-9jgJCLGS:/ https://bin.entware.net/aarch64-k3.10/installer/aarch64-installer.tar.gz
+   ```
+
+   | `arch` in `show version` | Installer URL |
+   |---|---|
+   | `aarch64` | `https://bin.entware.net/aarch64-k3.10/installer/aarch64-installer.tar.gz` |
+   | `mipsel` | `https://bin.entware.net/mipselsf-k3.4/installer/mipsel-installer.tar.gz` |
+   | `mips` | `https://bin.entware.net/mipssf-k3.4/installer/mips-installer.tar.gz` |
+
+   `show version` in the same CLI prints the architecture (`arch` field). Tested on Netcraze Hopper NC-3811 (aarch64, KeeneticOS 5.1)
+4. After 1–3 minutes the router log reports that Entware installation finished. SSH: `ssh root@192.168.1.1`, password `keenetic`. If the Keenetic "SSH server" component is installed, it owns port 22 — check the Entware port in `/opt/etc/config/dropbear.conf`
+5. Key-based login: Entware's dropbear reads root keys from `/opt/etc/dropbear/authorized_keys`, not from `~/.ssh`
 
 ## Installation
 
@@ -85,12 +107,44 @@ The output should include a policy with `"description": "xkeen"`. The installer 
 ## Post-Install Endpoints
 
 ```text
-On/Off Web Panel :  http://192.168.1.1:8181/
+Web Panel        :  http://192.168.1.1:8181/
 mihomo Dashboard :  http://192.168.1.1:9090/ui/
 mihomo API       :  http://192.168.1.1:9090 (secret printed after install)
 ```
 
 The API secret and all persisted settings live in `/opt/etc/dropweb-xkeen/settings.env` (`API_SECRET=`). At the end of installation, the script prints a pre-authenticated dashboard URL.
+
+## Web Panel
+
+`http://192.168.1.1:8181/` — from any device on the home network, no password or SSH.
+
+- **VPN** — running or disabled; "⛔ Disable VPN" / "✅ Enable VPN"
+- **Connection check** — tests plain internet and the VPN server separately, so you can tell an ISP problem from a server or config problem
+- **Subscription** — paid-until date, days left, last successful update, and whether a mirror address had to be used
+- **Update subscription** — fetch it now instead of waiting for the hourly run
+- **Change subscription link** — paste a new link from the bot. The panel tests it first; a broken link leaves the old one in place
+- **Update panel** — download the latest panel from this repository. The VPN keeps running
+
+When something is wrong with the subscription, an alert with a single action appears on top:
+
+| Panel says | What to press |
+|---|---|
+| All device slots are taken | "Free a slot" opens the dropweb devices page. Come back to the panel tab — it re-fetches the subscription by itself |
+| Subscription expired | "Renew subscription" opens the dropweb cabinet |
+| Subscription could not be downloaded | Check the internet; if that does not help, paste a fresh link from the bot |
+
+### How the panel updates itself
+
+The panel is two files in [`panel/`](panel/): `mihomo-panel.py` (server) and `index.html` (the whole page). The installer puts them into `/opt/share/dropweb-xkeen/panel/`; the "Update panel" button pulls them from the `main` branch.
+
+1. The branch is resolved to a commit via the GitHub API — raw files are cached for 5 minutes per branch, but a commit-hash URL is always fresh
+2. Both files are downloaded to a staging folder; `mihomo-panel.py` must compile and `index.html` must contain `<html`
+3. The new version is started on a free `127.0.0.1` port and must answer `/` and `/status` within 20 seconds
+4. Only then are the files swapped (the old ones go to `panel.bak`) and the panel restarts in the same process. The browser page reloads by itself
+
+If anything fails to download, compile or start, the current version stays and the panel says why.
+
+When you change anything in `panel/`, bump `PANEL_VERSION` in `mihomo-panel.py` — the panel shows it before and after the update. To try your own branch on a router, add `PANEL_SOURCE='https://raw.githubusercontent.com/<user>/dropweb-xkeen/<branch>/panel'` to `/opt/etc/dropweb-xkeen/settings.env` and press "Update panel". The installer honours the same `PANEL_SOURCE`.
 
 ## Emergency Bypass Scenarios
 
@@ -123,12 +177,12 @@ Same behavior as a normal reboot: without panic, the VPN starts on boot; after p
 
 **Do not hold the physical Reset button for 10+ seconds** — that performs a factory reset of KeeneticOS and wipes all router settings.
 
-## Troubleshooting: "Service Returned a Stub Config"
+## Troubleshooting: "All Device Slots Are Taken" / "Service Returned a Stub Config"
 
 If the subscription returns a stub instead of proxy nodes, the **device limit** has been reached or the HWID was rejected:
 
-1. In the dropweb bot → **Devices**, remove an unused device slot
-2. Re-run the installer: `sh /tmp/install.sh`
+1. The installer prints the link where you can free a slot (`https://cab.dropweb.site/devices…`); the same list is in the dropweb bot → **Devices**. Remove an unused device
+2. Re-run the installer: `sh /tmp/install.sh -y`. If the router is already set up, just press "Free a slot" in the web panel and then "Update subscription"
 
 The router's HWID is printed in the error message and stored in `/opt/etc/dropweb-xkeen/settings.env`. Avoid changing it unnecessarily, as a new HWID consumes another device slot.
 
@@ -137,6 +191,7 @@ The router's HWID is printed in the error message and stored in `/opt/etc/dropwe
 | Path | Purpose |
 |---|---|
 | `/opt/etc/dropweb-xkeen/settings.env` | Persisted configuration: subscription URL, HWID, ports, API secret |
+| `/opt/etc/dropweb-xkeen/sub-state.env` | Result of the last subscription update: expiry, mirrors, cabinet links (the panel builds its alerts from it) |
 | `/opt/sbin/xkeen`, `/opt/sbin/.xkeen/` | XKeen 2 |
 | `/opt/etc/init.d/S05xkeen` | XKeen init script (managed by XKeen: mihomo core, `start_auto`) |
 | `/opt/sbin/mihomo` | mihomo binary (installed and updated by XKeen) |
@@ -148,7 +203,7 @@ The router's HWID is printed in the error message and stored in `/opt/etc/dropwe
 | `/opt/sbin/mihomo-watchdog.sh` | Process watchdog (every minute via cron) |
 | `/opt/sbin/mihomo-panic.sh` | Emergency VPN kill/bypass script |
 | `/opt/sbin/mihomo-resume.sh` | Re-enable VPN script |
-| `/opt/sbin/mihomo-panel.py` | Lightweight web control panel (Python stdlib) |
+| `/opt/share/dropweb-xkeen/panel/` | Web panel: `mihomo-panel.py` (Python stdlib) and `index.html` |
 | `/opt/etc/init.d/S96mihomo-panel` | Web panel init script |
 | `/opt/sbin/mihomo-vpn-uninstall.sh` | Uninstaller |
 | `/opt/var/spool/cron/crontabs/root` | Cron jobs |
@@ -174,6 +229,9 @@ ssh root@192.168.1.1 xkeen -remove
 - **`mixed-port` stays local to the router** (`allow-lan: false`) — no SOCKS/HTTP proxy is exposed on the LAN; the installer uses it locally to verify outbound connectivity.
 - **`find-process-mode: off`** — resolving local socket owners makes no sense for forwarded LAN traffic and wastes CPU on MIPS/ARM routers.
 - **Content-addressed subscription updates.** Every hour the subscription is fetched, patched, validated with `mihomo -t`, and compared against the active config. Only if the resulting config differs is a backup saved and hot-reloaded via the mihomo API. If fetching fails or returns a stub, the working config is untouched.
+- **Subscription mirrors come from the subscription headers.** dropweb sends `dropweb-sub-mirrors` and `fallback-url`; the updater remembers them and uses them when the primary address does not respond. The stored link itself is not changed.
+- **The panel explains instead of logging.** Every updater run records its outcome (`updated`, `unchanged`, `device_limit`, `fetch_failed`, …) in `sub-state.env`; the panel turns it into one sentence and one button.
+- **The panel updates separately from everything else.** Its design will change more often than the installer, so it lives in its own files and updates from a button: no SSH, no mihomo restart, and only after a trial run of the new version.
 - **Deterministic HWID from LAN MAC.** Re-installs and upgrades reuse the same HWID so device slots are never leaked.
 - **XKeen 2.0.1 Beta only when required.** Non-interactive installation (`xkeen -i auto`) requires 2.0.1 Beta; stable is tried first and Beta is used only as a fallback.
 - **Fail-open by design (XKeen killswitch off).** If mihomo crashes, LAN devices fall back to direct internet access for up to a minute until the cron watchdog restarts mihomo, rather than bricking household connectivity.
