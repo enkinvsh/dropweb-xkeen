@@ -44,7 +44,7 @@ CONF=/opt/etc/mihomo/config.yaml
 PRECHECK_FILE=/tmp/dropweb-sub-check.$$
 ZASH_TMP=/tmp/dropweb-zash.$$
 
-trap 'rm -rf "$PRECHECK_FILE" "$ZASH_TMP" /tmp/xkeen-install.sh' EXIT
+trap 'rm -rf "$PRECHECK_FILE" "$PRECHECK_FILE.h" "$ZASH_TMP" /tmp/xkeen-install.sh' EXIT
 
 # --- вывод ---
 if [ -t 1 ]; then
@@ -130,7 +130,7 @@ done
 
 # --- окружение ---
 [ "$(id -u)" = "0" ] || die "Запускай от root: ssh root@192.168.1.1"
-[ -x /opt/bin/opkg ] || die "OPKG/Entware не найден. Сначала включи Entware на USB через веб-интерфейс Keenetic (Приложения → OPKG)."
+[ -x /opt/bin/opkg ] || die "OPKG/Entware не найден. Поставь Entware на флешку EXT4 — пошагово: https://github.com/enkinvsh/dropweb-xkeen#entware-с-нуля"
 mkdir -p /opt/var/log
 printf '\n===== dropweb-xkeen %s: %s =====\n' "$SCRIPT_VERSION" "$(date '+%F %T')" >>"$INSTALL_LOG"
 
@@ -199,7 +199,13 @@ DROPWEB_XKEEN_VERSION=$SCRIPT_VERSION
 [ -z "$ENV_API_SECRET" ]     || API_SECRET=$ENV_API_SECRET
 [ -z "$ENV_LAN_IP" ]         || LAN_IP=$ENV_LAN_IP
 
-rand_hex() { dd if=/dev/urandom bs=1 count="$1" 2>/dev/null | od -An -tx1 | tr -d ' \n'; }
+# $1 байт случайности в hex (не больше 16). busybox od в свежем Entware
+# не знает -A/-t, поэтому берём uuid ядра; od — только запасной путь.
+rand_hex() {
+  rh=$(tr -d '-' </proc/sys/kernel/random/uuid 2>/dev/null || true)
+  [ -n "$rh" ] || rh=$(dd if=/dev/urandom bs=1 count=16 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n' || true)
+  printf '%s' "$rh" | cut -c1-$(($1 * 2))
+}
 
 lan_mac() {
   lm=""
@@ -371,12 +377,23 @@ fetch_sub() {
   set -- -H "x-hwid: $HWID" -H "x-device-os: $DEVICE_OS"
   if [ -n "$OS_VERSION" ]; then set -- "$@" -H "x-ver-os: $OS_VERSION"; fi
   set -- "$@" -H "x-device-model: $DEVICE_MODEL" -A "$USER_AGENT_HDR"
-  curl -fsS --connect-timeout 15 --max-time 90 --retry 2 --retry-delay 5 "$@" -o "$PRECHECK_FILE" "$SUB_URL"
+  curl -fsS --connect-timeout 15 --max-time 90 --retry 2 --retry-delay 5 "$@" -D "$PRECHECK_FILE.h" -o "$PRECHECK_FILE" "$SUB_URL"
+}
+
+# Значение заголовка ответа подписки (последнее, без учёта регистра имени).
+precheck_hdr() {
+  awk -v k="$1" 'BEGIN{k=tolower(k)} {sub(/\r$/,""); i=index($0,":"); if(i>1 && tolower(substr($0,1,i-1))==k){v=substr($0,i+1); sub(/^[ \t]+/,"",v); val=v}} END{printf "%s", val}' "$PRECHECK_FILE.h" 2>/dev/null
 }
 
 inf "Проверяю подписку..."
 fetch_sub 2>>"$INSTALL_LOG" || die_log "Не скачалась подписка: проверь ссылку/интернет"
-if grep -qE 'Приложение не поддерживается|превысили лимит|00000000-0000-0000-0000-000000000000' "$PRECHECK_FILE"; then
+if grep -qE 'Приложение не поддерживается|превысили лимит|лимит устройств|00000000-0000-0000-0000-000000000000' "$PRECHECK_FILE"; then
+  # Панель dropweb кладёт в заголовок прямую ссылку на страницу устройств в кабинете.
+  devices_url=$(precheck_hdr dropweb-device-remove)
+  case "$devices_url" in https://*) ;; *) devices_url="" ;; esac
+  if [ -n "$devices_url" ]; then
+    die "Сервис вернул заглушку: все места для устройств на подписке заняты. Освободи место: $devices_url — и запусти установку снова (sh /tmp/install.sh -y). HWID роутера: $HWID"
+  fi
   die "Сервис вернул заглушку: лимит устройств исчерпан или HWID не принят. Удали старое устройство в боте dropweb (Устройства) и запусти установку снова. HWID роутера: $HWID"
 fi
 grep -Eq '^(proxies|proxy-providers):' "$PRECHECK_FILE" || die "Сервис вернул не конфиг mihomo — проверь ссылку (нужна ссылка на подписку из бота dropweb)."
