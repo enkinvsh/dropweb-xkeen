@@ -38,12 +38,16 @@
 
 set -eu
 
-DROPWEB_XKEEN_VERSION="2.3.0"
+DROPWEB_XKEEN_VERSION="2.3.2"
 SCRIPT_VERSION=$DROPWEB_XKEEN_VERSION
 
 # XKeen иначе уходит в фон и сразу возвращает 0 — нам нужен честный код возврата.
 export XKEEN_FOREGROUND=1
 export PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Запоминаем и убираем из окружения: иначе его унаследуют панель и mihomo,
+# которых этот скрипт перезапускает.
+FROM_UPDATER=${DXK_UPDATE:-0}
+unset DXK_UPDATE DXK_SELF_COPY
 
 INSTALL_LOG=/opt/var/log/dropweb-xkeen-install.log
 SETTINGS_DIR=/opt/etc/dropweb-xkeen
@@ -677,9 +681,15 @@ fi
 # 127.0.0.1 — REDIRECT приходит на LAN-адрес и отбивается. Записи listeners
 # слушают 0.0.0.0 независимо от allow-lan, поэтому порты XKeen задаём там.
 # mixed-port остаётся только для самого роутера. TUN на роутере ломает маршрутизацию.
+# log-level warning: S05xkeen запускает mihomo без перенаправления вывода
+# (start_verbose=on), и он пишет в лог того, кто его перезапустил (установка,
+# watchdog, обновление), — при info это строка на каждое соединение, лог растёт
+# на флешке без конца (2026-10-20 в логе установки было 2146 таких строк). Живые логи в
+# дашборде от уровня не зависят: подписчики API получают все события.
 export API_PORT API_SECRET
 EXPR='
 .tun.enable = false |
+."log-level" = "warning" |
 .tun."auto-route" = false |
 .tun."auto-redirect" = false |
 .tun."auto-detect-interface" = false |
@@ -944,11 +954,18 @@ PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin; export PATH
 export XKEEN_FOREGROUND=1
 
 # install.sh перепишет этот файл, а sh читает скрипт по ходу выполнения —
-# работаем из копии.
-if [ "${DXK_SELF_COPY:-}" != 1 ]; then
-  cp "$0" "/tmp/dxk-update.run.$$" || exit 1
-  DXK_SELF_COPY=1 exec sh "/tmp/dxk-update.run.$$" "$@"
-fi
+# работаем из копии. Копию узнаём по пути, а не по переменной окружения:
+# переменную унаследовали бы панель и mihomo, которых перезапускает install.sh,
+# и следующий запуск из панели удалил бы как «копию» сам этот файл
+# (так было в 2.3.0 на Hopper 2026-10-20).
+unset DXK_SELF_COPY
+case "$0" in
+  /tmp/dxk-update.run.*) SELF_COPY=$0 ;;
+  *)
+    cp "$0" "/tmp/dxk-update.run.$$" || exit 1
+    exec sh "/tmp/dxk-update.run.$$" "$@"
+    ;;
+esac
 
 SETTINGS=/opt/etc/dropweb-xkeen/settings.env
 STATE=/opt/etc/dropweb-xkeen/update-state.env
@@ -975,21 +992,21 @@ fi
 MODE=${1:-}
 case "$MODE" in
   check|run|auto) ;;
-  *) echo "Использование: dropweb-xkeen-update.sh check|run|auto" >&2; rm -f "$0"; exit 2 ;;
+  *) echo "Использование: dropweb-xkeen-update.sh check|run|auto" >&2; rm -f "$SELF_COPY"; exit 2 ;;
 esac
 
 if ! mkdir "$LOCK" 2>/dev/null; then
   p=$(cat "$LOCK/pid" 2>/dev/null)
   if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
     echo "уже идёт обновление (pid $p)"
-    rm -f "$0"
+    rm -f "$SELF_COPY"
     exit 3
   fi
   rm -rf "$LOCK"
-  mkdir "$LOCK" 2>/dev/null || { rm -f "$0"; exit 3; }
+  mkdir "$LOCK" 2>/dev/null || { rm -f "$SELF_COPY"; exit 3; }
 fi
 echo $$ >"$LOCK/pid"
-trap 'rm -rf "$LOCK" "$WORK" "$0"' EXIT
+trap 'rm -rf "$LOCK" "$WORK" "$SELF_COPY"' EXIT
 trap 'exit 1' INT TERM
 # Панель запускает нас и сама перезапускается посреди обновления.
 trap '' HUP
@@ -1486,12 +1503,52 @@ else
 fi
 
 # =============================================================================
+# Кнопка FN: короткое нажатие не должно отключать флешку
+# =============================================================================
+# На Keenetic/Netcraze FN по умолчанию «извлекает все накопители». Вместе
+# с флешкой останавливаются Entware, mihomo и панель — VPN пропадает целиком,
+# а объяснить это некому: панель тоже на флешке. 2026-10-19 так и случилось
+# на Hopper NC-3811. Снимаем UnmountAll с нажатий и оставляем его на удержании.
+protect_usb_buttons() {
+  command -v ndmc >/dev/null 2>&1 || return 1
+  binds=$(ndmc -c 'show button bindings' 2>/dev/null | tr -d '\033' | awk -F': *' '
+    /^[[:space:]]*button:/ { b = $2 }
+    /^[[:space:]]*action:/ { a = $2 }
+    /^[[:space:]]*active_handler:/ {
+      h = $2; gsub(/[[:space:]]/, "", b); gsub(/[[:space:]]/, "", a); gsub(/[[:space:]]/, "", h)
+      print b, a, (h == "" ? "-" : h)
+    }')
+  [ -n "$binds" ] || return 1
+  BUTTONS_FIXED=""
+  for b in $(printf '%s\n' "$binds" | awk '$3 == "UnmountAll" && ($2 == "click" || $2 == "double-click") { print $1 }' | sort -u); do
+    for a in $(printf '%s\n' "$binds" | awk -v b="$b" '$1 == b && $3 == "UnmountAll" && ($2 == "click" || $2 == "double-click") { print $2 }'); do
+      ndmc -c "no system button $b on $a" >>"$INSTALL_LOG" 2>&1 || return 1
+    done
+    # Удержание занято чем-то своим — не трогаем, флешку тогда извлекают из веб-интерфейса.
+    if printf '%s\n' "$binds" | awk -v b="$b" '$1 == b && $2 == "hold" && $3 == "-" { f = 1 } END { exit !f }'; then
+      ndmc -c "system button $b on hold do UnmountAll" >>"$INSTALL_LOG" 2>&1 || return 1
+    fi
+    BUTTONS_FIXED="$BUTTONS_FIXED $b"
+  done
+  [ -n "$BUTTONS_FIXED" ] || return 0
+  ndmc -c 'system configuration save' >>"$INSTALL_LOG" 2>&1
+}
+BUTTONS_FIXED=""
+if protect_usb_buttons; then
+  if [ -n "$BUTTONS_FIXED" ]; then
+    ok "Кнопка${BUTTONS_FIXED}: нажатие больше не отключает флешку (с ней пропал бы VPN), отключить — удержать 3 секунды"
+  fi
+else
+  warn "Не смог проверить кнопки роутера. Не нажимай FN: она может отключить флешку, и VPN пропадёт"
+fi
+
+# =============================================================================
 # Запуск
 # =============================================================================
 # Ручной повторный запуск включает VPN, а обновление (DXK_UPDATE=1 от
 # dropweb-xkeen-update.sh) оставляет его таким, каким его выключил человек.
 VPN_OFF=0
-if [ "${DXK_UPDATE:-}" = 1 ] && [ -f /opt/etc/mihomo/.disabled ]; then
+if [ "$FROM_UPDATER" = 1 ] && [ -f /opt/etc/mihomo/.disabled ]; then
   VPN_OFF=1
   inf "VPN выключен в панели — после обновления оставляю выключенным"
   # xkeen -um/-mihomo выше могли поднять mihomo заново.
