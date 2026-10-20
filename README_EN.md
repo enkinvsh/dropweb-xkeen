@@ -118,12 +118,12 @@ The API secret and all persisted settings live in `/opt/etc/dropweb-xkeen/settin
 
 `http://192.168.1.1:8181/` — from any device on the home network, no password or SSH.
 
-- **VPN** — running or disabled; "⛔ Disable VPN" / "✅ Enable VPN"
+- **VPN** — running or disabled; a switch with confirmation
 - **Connection check** — tests plain internet and the VPN server separately, so you can tell an ISP problem from a server or config problem
 - **Subscription** — paid-until date, days left, last successful update, and whether a mirror address had to be used
 - **Update subscription** — fetch it now instead of waiting for the hourly run
 - **Change subscription link** — paste a new link from the bot. The panel tests it first; a broken link leaves the old one in place
-- **Update panel** — download the latest panel from this repository. The VPN keeps running
+- **Update** — installed version and whether a new one is out; "Update to …" now and an "Update automatically" switch (on by default)
 
 When something is wrong with the subscription, an alert with a single action appears on top:
 
@@ -133,24 +133,30 @@ When something is wrong with the subscription, an alert with a single action app
 | Subscription expired | "Renew subscription" opens the dropweb cabinet |
 | Subscription could not be downloaded | Check the internet; if that does not help, paste a fresh link from the bot |
 
-### How the panel updates itself
+### How the router updates itself
 
-The panel is two files in [`panel/`](panel/): `mihomo-panel.py` (server) and `index.html` (the whole page). The installer puts them into `/opt/share/dropweb-xkeen/panel/`; the "Update panel" button pulls them from the `main` branch.
+Updates come from this repository: a new version is released when `DROPWEB_XKEEN_VERSION` in `install.sh` is bumped on `main`. The router checks every night and installs it by itself; with "Update automatically" off it only updates from the panel button. The work is done by `/opt/sbin/dropweb-xkeen-update.sh`:
 
-1. The branch is resolved to a commit via the GitHub API — raw files are cached for 5 minutes per branch, but a commit-hash URL is always fresh
-2. Both files are downloaded to a staging folder; `mihomo-panel.py` must compile and `index.html` must contain `<html`
-3. The new version is started on a free `127.0.0.1` port and must answer `/` and `/status` within 20 seconds
-4. Only then are the files swapped (the old ones go to `panel.bak`) and the panel restarts in the same process. The browser page reloads by itself
+1. The branch is resolved to a commit via the GitHub API — raw files are cached for 5 minutes per branch, but a commit-hash URL is always fresh. `install.sh` and `panel/` come from the same commit
+2. The downloaded `install.sh` must pass `sh -n`, `mihomo-panel.py` must compile, `index.html` must contain `<html`
+3. A snapshot of everything the installer touches (our scripts, mihomo, init scripts, panel, settings, config, cron) goes to `/opt/backups/dropweb-xkeen/snapshot`
+4. The new `install.sh -y` runs with the same subscription and HWID. A VPN disabled in the panel stays disabled
+5. Health check: mihomo and its API are up, XKeen rules are in place, internet via mihomo works (if it did before), the panel answers
+6. If the check fails, the snapshot is restored and that version is marked as failed: the nightly run skips it and waits for the next one. The button can still retry it
 
-If anything fails to download, compile or start, the current version stays and the panel says why.
+While an update runs, the watchdog stays quiet, and the panel page shows "Router is updating" and reloads by itself when it is done. The result goes to `/opt/etc/dropweb-xkeen/update-state.env` (shown in the panel) and `/opt/var/log/dropweb-xkeen-update.log`.
 
-When you change anything in `panel/`, bump `PANEL_VERSION` in `mihomo-panel.py` — the panel shows it before and after the update. To try your own branch on a router, add `PANEL_SOURCE='https://raw.githubusercontent.com/<user>/dropweb-xkeen/<branch>/panel'` to `/opt/etc/dropweb-xkeen/settings.env` and press "Update panel". The installer honours the same `PANEL_SOURCE`.
+By hand over SSH: `/opt/sbin/dropweb-xkeen-update.sh check` (look up the latest version) or `run` (update now).
+
+Routers on 2.1.x cannot update as a whole yet: press "Update panel" there, and the new panel gets the "Update" section.
+
+To try your own branch on a router, set `UPDATE_URL='https://raw.githubusercontent.com/<user>/dropweb-xkeen/<branch>'` in `/opt/etc/dropweb-xkeen/settings.env` and bump the version in that branch's `install.sh`. The installer honours the same `UPDATE_URL` (`UPDATE_URL=… sh install.sh`); `AUTO_UPDATE=0` means button only.
 
 ## Emergency Bypass Scenarios
 
-### 1. Web Panel → "⛔ Disable VPN"
+### 1. Web Panel → disable VPN
 
-One click stops mihomo and removes traffic interception so **all devices go directly to the internet**. The disabled state persists across reboots until you click "✅ Enable VPN".
+One click stops mihomo and removes traffic interception so **all devices go directly to the internet**. The disabled state persists across reboots until you enable it in the panel again.
 
 ### 2. SSH — if the web panel is unreachable
 
@@ -192,6 +198,7 @@ The router's HWID is printed in the error message and stored in `/opt/etc/dropwe
 |---|---|
 | `/opt/etc/dropweb-xkeen/settings.env` | Persisted configuration: subscription URL, HWID, ports, API secret |
 | `/opt/etc/dropweb-xkeen/sub-state.env` | Result of the last subscription update: expiry, mirrors, cabinet links (the panel builds its alerts from it) |
+| `/opt/etc/dropweb-xkeen/update-state.env` | Latest version on GitHub and the result of the last dropweb-xkeen self-update |
 | `/opt/sbin/xkeen`, `/opt/sbin/.xkeen/` | XKeen 2 |
 | `/opt/etc/init.d/S05xkeen` | XKeen init script (managed by XKeen: mihomo core, `start_auto`) |
 | `/opt/sbin/mihomo` | mihomo binary (installed and updated by XKeen) |
@@ -203,6 +210,8 @@ The router's HWID is printed in the error message and stored in `/opt/etc/dropwe
 | `/opt/sbin/mihomo-watchdog.sh` | Process watchdog (every minute via cron) |
 | `/opt/sbin/mihomo-panic.sh` | Emergency VPN kill/bypass script |
 | `/opt/sbin/mihomo-resume.sh` | Re-enable VPN script |
+| `/opt/sbin/dropweb-xkeen-update.sh` | dropweb-xkeen self-update from GitHub (nightly cron, panel button) |
+| `/opt/backups/dropweb-xkeen/snapshot` | Pre-update snapshot for rollback |
 | `/opt/share/dropweb-xkeen/panel/` | Web panel: `mihomo-panel.py` (Python stdlib) and `index.html` |
 | `/opt/etc/init.d/S96mihomo-panel` | Web panel init script |
 | `/opt/sbin/mihomo-vpn-uninstall.sh` | Uninstaller |
@@ -231,7 +240,7 @@ ssh root@192.168.1.1 xkeen -remove
 - **Content-addressed subscription updates.** Every hour the subscription is fetched, patched, validated with `mihomo -t`, and compared against the active config. Only if the resulting config differs is a backup saved and hot-reloaded via the mihomo API. If fetching fails or returns a stub, the working config is untouched.
 - **Subscription mirrors come from the subscription headers.** dropweb sends `dropweb-sub-mirrors` and `fallback-url`; the updater remembers them and uses them when the primary address does not respond. The stored link itself is not changed.
 - **The panel explains instead of logging.** Every updater run records its outcome (`updated`, `unchanged`, `device_limit`, `fetch_failed`, …) in `sub-state.env`; the panel turns it into one sentence and one button.
-- **The panel updates separately from everything else.** Its design will change more often than the installer, so it lives in its own files and updates from a button: no SSH, no mihomo restart, and only after a trial run of the new version.
+- **One version for everything, and rollback instead of hope.** The panel lives in its own files (`panel/`) so its look can change without touching the installer, but it updates together with the rest: the panel and the scripts on the router always come from the same commit. An update is a plain reinstall, and the snapshot taken before it brings everything back if the new version works worse.
 - **Deterministic HWID from LAN MAC.** Re-installs and upgrades reuse the same HWID so device slots are never leaked.
 - **XKeen 2.0.1 Beta only when required.** Non-interactive installation (`xkeen -i auto`) requires 2.0.1 Beta; stable is tried first and Beta is used only as a fallback.
 - **Fail-open by design (XKeen killswitch off).** If mihomo crashes, LAN devices fall back to direct internet access for up to a minute until the cron watchdog restarts mihomo, rather than bricking household connectivity.
