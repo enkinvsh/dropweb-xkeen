@@ -183,6 +183,14 @@ Same behavior as a normal reboot: without panic, the VPN starts on boot; after p
 
 **Do not hold the physical Reset button for 10+ seconds** — that performs a factory reset of KeeneticOS and wipes all router settings.
 
+## The VPN is gone entirely and the panel does not open
+
+Everything except Keenetic itself lives on the USB drive. If it is ejected, traffic goes direct and both the panel and SSH on port 22 go silent.
+
+- Check that the drive is in the router's USB port. Once it is back, Entware, the VPN and the panel come up on their own within a minute or two, no reboot needed.
+- By default the Keenetic FN button ejects the drive on a single press. The installer moves that to a 3-second hold and leaves a short press doing nothing. If the button already had its own hold action, the installer leaves it alone; then the drive can only be ejected from the Keenetic web UI.
+- The drive should be listed in the Keenetic web UI (http://192.168.1.1) under applications and storage. If it is missing, suspect the port or the drive itself.
+
 ## Troubleshooting: "All Device Slots Are Taken" / "Service Returned a Stub Config"
 
 If the subscription returns a stub instead of proxy nodes, the **device limit** has been reached or the HWID was rejected:
