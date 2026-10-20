@@ -15,16 +15,22 @@
 #    6. Ставит веб-панель (файлы panel/ из репозитория): VPN вкл/выкл, проверка
 #       связи, срок подписки, «Обновить сейчас», смена ссылки, подсказка с одной
 #       кнопкой, когда подписка упёрлась в лимит устройств или кончилась, и
-#       «Обновить панель» — новая версия панели с GitHub без переустановки
+#       раздел «Обновление»
 #    7. Ежечасно обновляет подписку (по содержимому, с горячей перезагрузкой;
 #       если основной адрес недоступен — через запасные из заголовков
 #       подписки) и ставит watchdog
+#    8. Обновляет сам себя с GitHub: ночью по cron (AUTO_UPDATE=1) или кнопкой
+#       в панели. /opt/sbin/dropweb-xkeen-update.sh запускает install.sh новой
+#       версии и, если после него VPN или панель не работают, возвращает
+#       прежнюю версию из снимка
 #
 #  Использование (на роутере по SSH под root):
 #     curl -fsSL -o /tmp/install.sh https://raw.githubusercontent.com/enkinvsh/dropweb-xkeen/main/install.sh
 #     sh /tmp/install.sh                              # спросит ссылку
 #     SUB_URL='https://...' sh /tmp/install.sh -y     # без вопросов
 #  Повторный запуск = обновление (HWID и ссылка сохраняются).
+#  Новая версия выходит, когда в main поднимается DROPWEB_XKEEN_VERSION:
+#  роутеры сравнивают её со своей и только тогда обновляются.
 #
 #  Удаление:
 #     /opt/sbin/mihomo-vpn-uninstall.sh
@@ -32,7 +38,7 @@
 
 set -eu
 
-DROPWEB_XKEEN_VERSION="2.1.0"
+DROPWEB_XKEEN_VERSION="2.3.0"
 SCRIPT_VERSION=$DROPWEB_XKEEN_VERSION
 
 # XKeen иначе уходит в фон и сразу возвращает 0 — нам нужен честный код возврата.
@@ -45,7 +51,8 @@ SETTINGS_FILE=$SETTINGS_DIR/settings.env
 LEGACY_UPDATER=/opt/sbin/update-mihomo-sub.sh
 LEGACY_PANEL=/opt/sbin/mihomo-panel.py
 PANEL_DIR=/opt/share/dropweb-xkeen/panel
-DEFAULT_PANEL_SOURCE=https://raw.githubusercontent.com/enkinvsh/dropweb-xkeen/main/panel
+DEFAULT_UPDATE_URL=https://raw.githubusercontent.com/enkinvsh/dropweb-xkeen/main
+SELF_UPDATER=/opt/sbin/dropweb-xkeen-update.sh
 XKEEN_INIT=/opt/etc/init.d/S05xkeen
 CONF=/opt/etc/mihomo/config.yaml
 PRECHECK_FILE=/tmp/dropweb-sub-check.$$
@@ -116,8 +123,9 @@ dropweb-xkeen — VPN dropweb на Keenetic через XKeen 2 + mihomo
   API_PORT        порт API и дашборда mihomo (9090)
   API_SECRET      секрет API mihomo (генерируется)
   LAN_IP          адрес роутера в LAN (из br0, иначе 192.168.1.1)
-  PANEL_SOURCE    откуда брать файлы веб-панели и её обновления
-                  (https://raw.githubusercontent.com/enkinvsh/dropweb-xkeen/main/panel)
+  UPDATE_URL      откуда брать обновления и файлы панели: raw-адрес ветки
+                  (https://raw.githubusercontent.com/enkinvsh/dropweb-xkeen/main)
+  AUTO_UPDATE     1 — обновляться самому ночью (по умолчанию), 0 — только кнопкой
   ASSUME_YES=1    то же, что -y
 
 Пример:
@@ -162,10 +170,12 @@ ENV_PANEL_PORT=${PANEL_PORT:-}
 ENV_API_PORT=${API_PORT:-}
 ENV_API_SECRET=${API_SECRET:-}
 ENV_LAN_IP=${LAN_IP:-}
-ENV_PANEL_SOURCE=${PANEL_SOURCE:-}
+ENV_UPDATE_URL=${UPDATE_URL:-}
+ENV_AUTO_UPDATE=${AUTO_UPDATE:-}
 
 SUB_URL=""; HWID=""; DEVICE_OS=""; OS_VERSION=""; DEVICE_MODEL=""
-USER_AGENT_HDR=""; PANEL_PORT=""; API_PORT=""; API_SECRET=""; LAN_IP=""; PANEL_SOURCE=""
+USER_AGENT_HDR=""; PANEL_PORT=""; API_PORT=""; API_SECRET=""; LAN_IP=""
+UPDATE_URL=""; AUTO_UPDATE=""; PANEL_SOURCE=""
 
 SETTINGS_ORIGIN="новая установка"
 if [ -f "$SETTINGS_FILE" ]; then
@@ -208,7 +218,12 @@ DROPWEB_XKEEN_VERSION=$SCRIPT_VERSION
 [ -z "$ENV_API_PORT" ]       || API_PORT=$ENV_API_PORT
 [ -z "$ENV_API_SECRET" ]     || API_SECRET=$ENV_API_SECRET
 [ -z "$ENV_LAN_IP" ]         || LAN_IP=$ENV_LAN_IP
-[ -z "$ENV_PANEL_SOURCE" ]   || PANEL_SOURCE=$ENV_PANEL_SOURCE
+[ -z "$ENV_UPDATE_URL" ]     || UPDATE_URL=$ENV_UPDATE_URL
+[ -z "$ENV_AUTO_UPDATE" ]    || AUTO_UPDATE=$ENV_AUTO_UPDATE
+# 2.1.x хранила только адрес панели (PANEL_SOURCE=<ветка>/panel): адрес ветки — на уровень выше.
+if [ -z "$UPDATE_URL" ]; then
+  case "$PANEL_SOURCE" in http://?*/panel|https://?*/panel) UPDATE_URL=${PANEL_SOURCE%/panel} ;; esac
+fi
 
 # $1 байт случайности в hex (не больше 16). busybox od в свежем Entware
 # не знает -A/-t, поэтому берём uuid ядра; od — только запасной путь.
@@ -272,11 +287,12 @@ if [ -z "$LAN_IP" ] && command -v ip >/dev/null 2>&1; then
   LAN_IP=$(ip -4 -o addr show br0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
 fi
 [ -n "$LAN_IP" ]         || LAN_IP="192.168.1.1"
-[ -n "$PANEL_SOURCE" ]   || PANEL_SOURCE=$DEFAULT_PANEL_SOURCE
-PANEL_SOURCE=${PANEL_SOURCE%/}
+[ -n "$UPDATE_URL" ]     || UPDATE_URL=$DEFAULT_UPDATE_URL
+UPDATE_URL=${UPDATE_URL%/}
+[ "$AUTO_UPDATE" = 0 ]   || AUTO_UPDATE=1
 
 case "$PANEL_PORT" in ''|*[!0-9]*) die "PANEL_PORT должен быть числом (сейчас: $PANEL_PORT)" ;; esac
-case "$PANEL_SOURCE" in http://?*|https://?*) ;; *) die "PANEL_SOURCE должен быть адресом http(s):// (сейчас: $PANEL_SOURCE)" ;; esac
+case "$UPDATE_URL" in http://?*|https://?*) ;; *) die "UPDATE_URL должен быть адресом http(s):// (сейчас: $UPDATE_URL)" ;; esac
 case "$API_PORT" in ''|*[!0-9]*) die "API_PORT должен быть числом (сейчас: $API_PORT)" ;; esac
 [ -n "$API_SECRET" ] || die "Не смог сгенерировать секрет API (/dev/urandom недоступен?)"
 
@@ -325,6 +341,11 @@ say "  user-agent   : $USER_AGENT_HDR"
 say "  панель       : порт $PANEL_PORT"
 say "  API mihomo   : порт $API_PORT"
 say "  адрес в LAN  : $LAN_IP"
+if [ "$AUTO_UPDATE" = 1 ]; then
+  say "  обновления   : сами, ночью ($UPDATE_URL)"
+else
+  say "  обновления   : только кнопкой в панели ($UPDATE_URL)"
+fi
 say "  (любой параметр можно задать переменной окружения, см. sh install.sh -h)"
 say ""
 
@@ -354,7 +375,8 @@ save_settings() {
       printf 'API_PORT=%s\n' "$(shq "$API_PORT")"
       printf 'API_SECRET=%s\n' "$(shq "$API_SECRET")"
       printf 'LAN_IP=%s\n' "$(shq "$LAN_IP")"
-      printf 'PANEL_SOURCE=%s\n' "$(shq "$PANEL_SOURCE")"
+      printf 'UPDATE_URL=%s\n' "$(shq "$UPDATE_URL")"
+      printf 'AUTO_UPDATE=%s\n' "$(shq "$AUTO_UPDATE")"
     } >"$ss_tmp"
   )
   chmod 600 "$ss_tmp"
@@ -734,6 +756,8 @@ LOG=/opt/var/log/mihomo-watchdog.log
 LOCK=/tmp/mihomo-watchdog.lock
 
 [ -f /opt/etc/mihomo/.disabled ] && exit 0
+# Во время обновления mihomo перезапускает install.sh — не мешаем ему.
+[ -d /tmp/dxk-update.lock ] && exit 0
 grep -Eq '^[[:space:]]*start_auto="on"' /opt/etc/init.d/S05xkeen 2>/dev/null || exit 0
 pidof mihomo >/dev/null 2>&1 && exit 0
 # Дать S05xkeen спокойно отработать при загрузке роутера.
@@ -901,9 +925,319 @@ exit 1
 EOF_RESUME
 }
 
-# Панель — отдельные файлы репозитория (panel/): её можно переделывать и обновлять
-# кнопкой в самой панели, не запуская установку. Берём panel/ рядом со скриптом
-# (запуск из клона), иначе качаем из PANEL_SOURCE.
+write_self_updater() {
+cat >"$SELF_UPDATER" <<'EOF_SELFUPDATE'
+#!/opt/bin/sh
+# dropweb-xkeen: обновление самого dropweb-xkeen с GitHub.
+#   check  узнать последнюю версию (панель показывает «Есть обновление»)
+#   run    обновить сейчас, если вышла новая версия (кнопка в панели)
+#   auto   cron ночью: при AUTO_UPDATE=1 то же, что run, но версию, которая
+#          уже откатывалась, сам не ставит — ждёт следующую
+# Обновление = install.sh новой версии и panel/ из того же коммита. Перед ним
+# снимок наших файлов и mihomo; если после установки VPN или панель работают
+# хуже, чем до неё, снимок возвращается на место.
+# Итог пишется в update-state.env: по нему панель объясняет, что произошло.
+# Коды выхода: 0 ок или обновлять нечего, 1 ошибка или откат, 2 неверный
+# вызов, 3 уже идёт другое обновление.
+set -u
+PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin; export PATH
+export XKEEN_FOREGROUND=1
+
+# install.sh перепишет этот файл, а sh читает скрипт по ходу выполнения —
+# работаем из копии.
+if [ "${DXK_SELF_COPY:-}" != 1 ]; then
+  cp "$0" "/tmp/dxk-update.run.$$" || exit 1
+  DXK_SELF_COPY=1 exec sh "/tmp/dxk-update.run.$$" "$@"
+fi
+
+SETTINGS=/opt/etc/dropweb-xkeen/settings.env
+STATE=/opt/etc/dropweb-xkeen/update-state.env
+LOG=/opt/var/log/dropweb-xkeen-update.log
+LOCK=/tmp/dxk-update.lock
+WORK=/tmp/dxk-update
+SNAP=/opt/backups/dropweb-xkeen/snapshot
+CONF=/opt/etc/mihomo/config.yaml
+DEFAULT_URL=https://raw.githubusercontent.com/enkinvsh/dropweb-xkeen/main
+# Всё, что меняет повторный install.sh. Чего из списка не было до обновления,
+# откат удаляет.
+SNAP_PATHS="/opt/sbin/update-mihomo-sub.sh /opt/sbin/mihomo-watchdog.sh /opt/sbin/mihomo-panic.sh
+/opt/sbin/mihomo-resume.sh /opt/sbin/mihomo-vpn-uninstall.sh /opt/sbin/dropweb-xkeen-update.sh
+/opt/sbin/mihomo /opt/etc/init.d/S05xkeen /opt/etc/init.d/S96mihomo-panel /opt/share/dropweb-xkeen
+/opt/etc/dropweb-xkeen/settings.env /opt/etc/dropweb-xkeen/sub-state.env $CONF
+/opt/etc/mihomo/.disabled /opt/var/spool/cron/crontabs/root"
+
+mkdir -p /opt/var/log
+log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+if [ -f "$LOG" ] && [ "$(wc -c <"$LOG")" -gt 262144 ]; then
+  tail -n 800 "$LOG" >"$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+fi
+
+MODE=${1:-}
+case "$MODE" in
+  check|run|auto) ;;
+  *) echo "Использование: dropweb-xkeen-update.sh check|run|auto" >&2; rm -f "$0"; exit 2 ;;
+esac
+
+if ! mkdir "$LOCK" 2>/dev/null; then
+  p=$(cat "$LOCK/pid" 2>/dev/null)
+  if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+    echo "уже идёт обновление (pid $p)"
+    rm -f "$0"
+    exit 3
+  fi
+  rm -rf "$LOCK"
+  mkdir "$LOCK" 2>/dev/null || { rm -f "$0"; exit 3; }
+fi
+echo $$ >"$LOCK/pid"
+trap 'rm -rf "$LOCK" "$WORK" "$0"' EXIT
+trap 'exit 1' INT TERM
+# Панель запускает нас и сама перезапускается посреди обновления.
+trap '' HUP
+
+if [ ! -f "$SETTINGS" ]; then
+  log "ERR: нет $SETTINGS — запусти install.sh заново"
+  exit 1
+fi
+# shellcheck source=/dev/null
+. "$SETTINGS"
+: "${DROPWEB_XKEEN_VERSION:=0}" "${UPDATE_URL:=}" "${AUTO_UPDATE:=1}" "${PANEL_SOURCE:=}"
+: "${PANEL_PORT:=8181}" "${API_PORT:=9090}" "${API_SECRET:=}"
+# Первое обновление с 2.1.x: там вместо UPDATE_URL был только адрес панели.
+if [ -z "$UPDATE_URL" ]; then
+  case "$PANEL_SOURCE" in http://?*/panel|https://?*/panel) UPDATE_URL=${PANEL_SOURCE%/panel} ;; esac
+fi
+[ -n "$UPDATE_URL" ] || UPDATE_URL=$DEFAULT_URL
+UPDATE_URL=${UPDATE_URL%/}
+CUR=$DROPWEB_XKEEN_VERSION
+
+shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+UPD_CHECKED_AT=""; UPD_CHECK_ERR=""; UPD_LATEST=""; UPD_LATEST_COMMIT=""
+UPD_RESULT=""; UPD_RESULT_AT=""; UPD_FROM=""; UPD_TO=""; UPD_MODE=""; UPD_PID=""; UPD_FAILED=""
+if [ -f "$STATE" ]; then
+  # shellcheck source=/dev/null
+  . "$STATE"
+fi
+
+save_state() {
+  {
+    printf '# dropweb-xkeen: проверка и обновление (пишет dropweb-xkeen-update.sh, читает панель)\n'
+    printf 'UPD_CHECKED_AT=%s\n' "$(shq "$UPD_CHECKED_AT")"
+    printf 'UPD_CHECK_ERR=%s\n' "$(shq "$UPD_CHECK_ERR")"
+    printf 'UPD_LATEST=%s\n' "$(shq "$UPD_LATEST")"
+    printf 'UPD_LATEST_COMMIT=%s\n' "$(shq "$UPD_LATEST_COMMIT")"
+    printf 'UPD_RESULT=%s\n' "$(shq "$UPD_RESULT")"
+    printf 'UPD_RESULT_AT=%s\n' "$(shq "$UPD_RESULT_AT")"
+    printf 'UPD_FROM=%s\n' "$(shq "$UPD_FROM")"
+    printf 'UPD_TO=%s\n' "$(shq "$UPD_TO")"
+    printf 'UPD_MODE=%s\n' "$(shq "$UPD_MODE")"
+    printf 'UPD_PID=%s\n' "$(shq "$UPD_PID")"
+    printf 'UPD_FAILED=%s\n' "$(shq "$UPD_FAILED")"
+  } >"$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+}
+
+finish() {
+  UPD_RESULT=$1; UPD_RESULT_AT=$(date +%s); UPD_PID=""
+  save_state
+  exit "$2"
+}
+
+# $1 новее $2? Сравнение по числам через точку: 2.10.0 > 2.9.1.
+ver_gt() {
+  awk -v a="$1" -v b="$2" 'BEGIN{n=split(a,x,".");m=split(b,y,".");k=n>m?n:m
+    for(i=1;i<=k;i++){p=x[i]+0;q=y[i]+0;if(p>q)exit 0;if(p<q)exit 1};exit 1}'
+}
+
+# raw.githubusercontent.com держит файлы веточного адреса в кэше до 5 минут:
+# фиксируем коммит через API, тогда install.sh и panel/ гарантированно из одного.
+BASE=$UPDATE_URL; COMMIT=""
+resolve() {
+  case "$UPDATE_URL" in
+    https://raw.githubusercontent.com/?*/?*/?*)
+      r=${UPDATE_URL#https://raw.githubusercontent.com/}
+      owner=${r%%/*}; r=${r#*/}; repo=${r%%/*}; ref=${r#*/}
+      sha=$(curl -fsS --connect-timeout 15 --max-time 30 -H 'Accept: application/vnd.github.sha' \
+        "https://api.github.com/repos/$owner/$repo/commits/$ref" 2>>"$LOG") || sha=""
+      if printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+        BASE="https://raw.githubusercontent.com/$owner/$repo/$sha"; COMMIT=$sha
+      else
+        log "SHA ветки $ref не получен — качаю по ветке"
+      fi
+      ;;
+  esac
+}
+
+get() { curl -fsSL --connect-timeout 15 --max-time 120 --retry 2 -o "$2" "$BASE/$1" 2>>"$LOG"; }
+
+NEW=""
+do_check() {
+  rm -rf "$WORK"
+  mkdir -p "$WORK/panel"
+  resolve
+  if ! get install.sh "$WORK/install.sh"; then
+    log "ERR: не скачался $BASE/install.sh"
+    UPD_CHECK_ERR=fetch_failed; return 1
+  fi
+  NEW=$(sed -n 's/^DROPWEB_XKEEN_VERSION="\([^"]*\)".*/\1/p' "$WORK/install.sh" | head -n1)
+  if [ -z "$NEW" ] || ! sh -n "$WORK/install.sh" 2>>"$LOG"; then
+    log "ERR: скачанный install.sh битый"
+    UPD_CHECK_ERR=bad_files; return 1
+  fi
+  UPD_CHECK_ERR=""; UPD_CHECKED_AT=$(date +%s); UPD_LATEST=$NEW; UPD_LATEST_COMMIT=$COMMIT
+  return 0
+}
+
+net_ok() {
+  mp=$(yq '."mixed-port" // ""' "$CONF" 2>/dev/null)
+  [ -n "$mp" ] || return 1
+  i=0
+  while [ "$i" -lt 4 ]; do
+    c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -x "http://127.0.0.1:$mp" \
+      https://www.gstatic.com/generate_204 2>/dev/null)
+    [ "$c" = 204 ] && return 0
+    i=$((i + 1)); sleep 5
+  done
+  return 1
+}
+
+# $1=1 — требовать ещё и выход в интернет через mihomo (если он был до обновления).
+health() {
+  if [ ! -f /opt/etc/mihomo/.disabled ]; then
+    i=0; up=0
+    while [ "$i" -lt 30 ]; do
+      if pidof mihomo >/dev/null 2>&1 && curl -s --noproxy '*' --max-time 3 -H "Authorization: Bearer $API_SECRET" \
+        "http://127.0.0.1:$API_PORT/version" 2>/dev/null | grep -q version; then
+        up=1; break
+      fi
+      i=$((i + 1)); sleep 2
+    done
+    [ "$up" = 1 ] || { log "проверка: mihomo или его API не поднялись"; return 1; }
+    if ! iptables -w -t nat -S 2>/dev/null | grep -q -- '-j xkeen' \
+      && ! iptables -w -t mangle -S 2>/dev/null | grep -q -- '-j xkeen'; then
+      log "проверка: нет правил XKeen в iptables"; return 1
+    fi
+    if [ "$1" = 1 ] && ! net_ok; then log "проверка: нет интернета через mihomo"; return 1; fi
+  fi
+  i=0
+  while [ "$i" -lt 20 ]; do
+    curl -s --noproxy '*' --max-time 5 "http://127.0.0.1:$PANEL_PORT/status" 2>/dev/null | grep -q '"running"' && return 0
+    i=$((i + 1)); sleep 1
+  done
+  log "проверка: панель не отвечает"
+  return 1
+}
+
+snapshot() {
+  rm -rf "$SNAP"
+  mkdir -p "$SNAP" || return 1
+  : >"$SNAP/.absent"
+  for p in $SNAP_PATHS; do
+    if [ -e "$p" ]; then
+      mkdir -p "$SNAP$(dirname "$p")" && cp -a "$p" "$SNAP$p" || return 1
+    else
+      echo "$p" >>"$SNAP/.absent"
+    fi
+  done
+  echo "$CUR" >"$SNAP/.version"
+}
+
+restore() {
+  for p in $SNAP_PATHS; do
+    if [ -e "$SNAP$p" ]; then
+      rm -rf "$p"; mkdir -p "$(dirname "$p")"; cp -a "$SNAP$p" "$p"
+    elif grep -qx "$p" "$SNAP/.absent"; then
+      rm -rf "$p"
+    fi
+  done
+  for c in /opt/etc/init.d/S05crond /opt/etc/init.d/S10cron; do
+    if [ -x "$c" ]; then "$c" restart >>"$LOG" 2>&1; break; fi
+  done
+  if [ -f /opt/etc/mihomo/.disabled ]; then
+    /opt/sbin/mihomo-panic.sh >>"$LOG" 2>&1
+  else
+    xkeen -auto on </dev/null >>"$LOG" 2>&1
+    xkeen -restart </dev/null >>"$LOG" 2>&1
+  fi
+  /opt/etc/init.d/S96mihomo-panel restart >>"$LOG" 2>&1
+  # shellcheck source=/dev/null
+  . "$SETTINGS"
+}
+
+do_update() {
+  if ! get panel/mihomo-panel.py "$WORK/panel/mihomo-panel.py" || ! get panel/index.html "$WORK/panel/index.html"; then
+    log "ERR: не скачались файлы панели из $BASE"
+    finish fetch_failed 1
+  fi
+  if ! python3 -c 'import sys; compile(open(sys.argv[1], "rb").read(), sys.argv[1], "exec")' \
+    "$WORK/panel/mihomo-panel.py" 2>>"$LOG" || ! grep -qi '<html' "$WORK/panel/index.html"; then
+    log "ERR: скачанные файлы панели битые"
+    finish bad_files 1
+  fi
+  need_net=0
+  if [ ! -f /opt/etc/mihomo/.disabled ] && net_ok; then need_net=1; fi
+  if ! snapshot; then
+    log "ERR: не смог сохранить снимок в $SNAP — не обновляю"
+    finish failed 1
+  fi
+  UPD_FROM=$CUR; UPD_TO=$NEW; UPD_MODE=$MODE; UPD_PID=$$; UPD_RESULT=running; UPD_RESULT_AT=$(date +%s)
+  save_state
+  log "обновляю $CUR → $NEW (${COMMIT:-$BASE}, $MODE)"
+  if DXK_UPDATE=1 sh "$WORK/install.sh" -y </dev/null >>"$LOG" 2>&1; then
+    # shellcheck source=/dev/null
+    . "$SETTINGS"
+    if health "$need_net"; then
+      log "обновлено до $NEW"
+      UPD_FAILED=""
+      finish updated 0
+    fi
+  else
+    log "install.sh $NEW завершился с ошибкой"
+  fi
+  log "новая версия не заработала — возвращаю $CUR из снимка"
+  UPD_FAILED=${COMMIT:-$NEW}
+  restore
+  if health "$need_net"; then
+    log "откат на $CUR выполнен"
+    finish rolled_back 1
+  fi
+  log "ERR: после отката проверка тоже не проходит"
+  finish rollback_failed 1
+}
+
+if ! do_check; then
+  save_state
+  [ "$MODE" = run ] && finish "$UPD_CHECK_ERR" 1
+  exit 1
+fi
+save_state
+if ! ver_gt "$NEW" "$CUR"; then
+  [ "$MODE" = run ] && log "последняя версия $NEW, у нас $CUR — обновлять нечего"
+  [ "$MODE" = run ] && finish same 0
+  exit 0
+fi
+case "$MODE" in
+  check)
+    echo "$NEW"
+    exit 0
+    ;;
+  auto)
+    if [ "$AUTO_UPDATE" != 1 ]; then
+      log "вышла $NEW, автообновление выключено — жду кнопку в панели"
+      exit 0
+    fi
+    if [ -n "$UPD_FAILED" ] && [ "$UPD_FAILED" = "${COMMIT:-$NEW}" ]; then
+      log "версия $NEW уже откатывалась — жду следующую"
+      exit 0
+    fi
+    ;;
+esac
+do_update
+EOF_SELFUPDATE
+}
+
+# Панель — отдельные файлы репозитория (panel/), чтобы её вид можно было менять,
+# не трогая этот скрипт. Берём panel/ рядом со скриптом (запуск из клона или из
+# обновления — оно кладёт файлы того же коммита), иначе качаем из UPDATE_URL.
 install_panel() {
   ip_stage=$PANEL_DIR.new
   ip_local=""
@@ -917,7 +1251,7 @@ install_panel() {
     if [ -n "$ip_local" ]; then
       cp "$ip_local/$ip_f" "$ip_stage/$ip_f" || return 1
     else
-      curl -fsSL --connect-timeout 15 --max-time 60 --retry 2 -o "$ip_stage/$ip_f" "$PANEL_SOURCE/$ip_f" 2>>"$INSTALL_LOG" || return 1
+      curl -fsSL --connect-timeout 15 --max-time 60 --retry 2 -o "$ip_stage/$ip_f" "$UPDATE_URL/panel/$ip_f" 2>>"$INSTALL_LOG" || return 1
     fi
   done
   /opt/bin/python3 -c 'import sys; compile(open(sys.argv[1], "rb").read(), sys.argv[1], "exec")' "$ip_stage/mihomo-panel.py" 2>>"$INSTALL_LOG" || return 1
@@ -928,7 +1262,7 @@ install_panel() {
   chmod 755 "$PANEL_DIR/mihomo-panel.py"
   chmod 644 "$PANEL_DIR/index.html"
   rm -rf "$ip_stage"
-  PANEL_FROM=${ip_local:-$PANEL_SOURCE}
+  PANEL_FROM=${ip_local:-$UPDATE_URL/panel}
 }
 
 write_panel_init() {
@@ -1021,7 +1355,7 @@ if [ -x /opt/etc/init.d/S96mihomo-panel ]; then /opt/etc/init.d/S96mihomo-panel 
 
 if [ -f "$CRONTAB" ]; then
   tmp="$CRONTAB.tmp.$$"
-  grep -vE '/opt/sbin/(update-mihomo-sub\.sh|update-dropweb-mihomo\.sh|mihomo-watchdog\.sh)' "$CRONTAB" >"$tmp"
+  grep -vE '/opt/sbin/(update-mihomo-sub\.sh|update-dropweb-mihomo\.sh|mihomo-watchdog\.sh|dropweb-xkeen-update\.sh)' "$CRONTAB" >"$tmp"
   chmod 600 "$tmp" && mv "$tmp" "$CRONTAB"
 fi
 for c in /opt/etc/init.d/S05crond /opt/etc/init.d/S10cron; do
@@ -1030,12 +1364,12 @@ done
 
 rm -f /opt/etc/init.d/S96mihomo-panel /opt/etc/init.d/S97mihomo \
   /opt/sbin/update-mihomo-sub.sh /opt/sbin/mihomo-start.sh /opt/sbin/mihomo-resume.sh /opt/sbin/mihomo-panic.sh \
-  /opt/sbin/mihomo-panel.py /opt/sbin/mihomo-watchdog.sh \
+  /opt/sbin/mihomo-panel.py /opt/sbin/mihomo-watchdog.sh /opt/sbin/dropweb-xkeen-update.sh \
   /opt/etc/mihomo/config.yaml /opt/etc/mihomo/.sub.raw.yaml /opt/etc/mihomo/.config.new.yaml \
   /opt/etc/mihomo/.sub.headers \
   /opt/var/run/mihomo-panel.pid
-rm -rf /opt/etc/mihomo/zash /opt/backups/mihomo /opt/etc/dropweb-xkeen /opt/share/dropweb-xkeen
-rm -f /opt/var/log/mihomo-*.log
+rm -rf /opt/etc/mihomo/zash /opt/backups/mihomo /opt/backups/dropweb-xkeen /opt/etc/dropweb-xkeen /opt/share/dropweb-xkeen
+rm -f /opt/var/log/mihomo-*.log /opt/var/log/dropweb-xkeen-update.log
 
 echo "Готово. XKeen и mihomo оставлены (автозапуск XKeen выключен). Удалить их полностью: xkeen -remove"
 rm -f "$0"
@@ -1047,11 +1381,12 @@ write_updater
 write_watchdog
 write_panic
 write_resume
+write_self_updater
 write_panel_init
 write_uninstall
 chmod +x /opt/sbin/update-mihomo-sub.sh /opt/sbin/mihomo-watchdog.sh /opt/sbin/mihomo-panic.sh \
   /opt/sbin/mihomo-resume.sh /opt/etc/init.d/S96mihomo-panel \
-  /opt/sbin/mihomo-vpn-uninstall.sh
+  /opt/sbin/mihomo-vpn-uninstall.sh "$SELF_UPDATER"
 ok "Скрипты в /opt/sbin и /opt/etc/init.d/S96mihomo-panel"
 
 PANEL_FROM=""
@@ -1059,9 +1394,9 @@ if install_panel; then
   rm -f "$LEGACY_PANEL"
   ok "Веб-панель в $PANEL_DIR (из $PANEL_FROM)"
 elif [ -f "$PANEL_DIR/mihomo-panel.py" ]; then
-  warn "Не скачались файлы веб-панели ($PANEL_SOURCE) — оставляю прежнюю версию"
+  warn "Не скачались файлы веб-панели ($UPDATE_URL/panel) — оставляю прежнюю версию"
 else
-  warn "Не скачались файлы веб-панели ($PANEL_SOURCE) — VPN работает и без неё; повтори установку позже"
+  warn "Не скачались файлы веб-панели ($UPDATE_URL/panel) — VPN работает и без неё; повтори установку позже"
 fi
 
 # =============================================================================
@@ -1104,7 +1439,8 @@ else
 fi
 
 # =============================================================================
-# cron: обновление подписки раз в час + watchdog раз в минуту
+# cron: обновление подписки раз в час, watchdog раз в минуту, проверка
+# обновлений dropweb-xkeen раз в сутки ночью
 # =============================================================================
 inf "Настраиваю cron..."
 CRON_DIR=/opt/var/spool/cron/crontabs
@@ -1114,10 +1450,17 @@ mkdir -p "$CRON_DIR"
 # Минута из HWID: роутеры не ломятся в шлюз подписки одновременно.
 cron_min=$(printf '%s' "$HWID" | cksum 2>/dev/null | awk '{print $1 % 60}')
 case "$cron_min" in ''|*[!0-9]*) cron_min=13 ;; esac
+# Обновление — со сдвигом на полчаса от подписки (install.sh сам её обновляет)
+# и в 3 или 4 часа: GitHub не получает все роутеры разом, а дома все спят.
+upd_min=$(( (cron_min + 30) % 60 ))
+upd_hour=$(( 3 + cron_min % 2 ))
 cron_tmp="$CRON_DIR/.root.tmp.$$"
-grep -vE '/opt/sbin/(update-mihomo-sub\.sh|update-dropweb-mihomo\.sh|mihomo-watchdog\.sh)' "$CRONTAB" >"$cron_tmp" || true
-printf '%s * * * * /opt/sbin/update-mihomo-sub.sh\n' "$cron_min" >>"$cron_tmp"
-printf '* * * * * /opt/sbin/mihomo-watchdog.sh\n' >>"$cron_tmp"
+grep -vE '/opt/sbin/(update-mihomo-sub\.sh|update-dropweb-mihomo\.sh|mihomo-watchdog\.sh|dropweb-xkeen-update\.sh)' "$CRONTAB" >"$cron_tmp" || true
+{
+  printf '%s * * * * /opt/sbin/update-mihomo-sub.sh\n' "$cron_min"
+  printf '* * * * * /opt/sbin/mihomo-watchdog.sh\n'
+  printf '%s %s * * * %s auto\n' "$upd_min" "$upd_hour" "$SELF_UPDATER"
+} >>"$cron_tmp"
 chmod 600 "$cron_tmp"
 mv "$cron_tmp" "$CRONTAB"
 
@@ -1135,15 +1478,30 @@ elif [ -z "$(pidof crond 2>/dev/null || true)" ]; then
   warn "crond не запущен после $cron_init restart — проверь: $cron_init start"
 else
   ok "cron: подписка в $cron_min-ю минуту каждого часа, watchdog раз в минуту"
+  if [ "$AUTO_UPDATE" = 1 ]; then
+    ok "cron: обновления dropweb-xkeen каждую ночь в $upd_hour:$(printf '%02d' "$upd_min")"
+  else
+    ok "cron: проверка обновлений в $upd_hour:$(printf '%02d' "$upd_min"), ставить — кнопкой в панели"
+  fi
 fi
 
 # =============================================================================
 # Запуск
 # =============================================================================
-inf "Запускаю XKeen + mihomo..."
-rm -f /opt/etc/mihomo/.disabled
-/opt/sbin/xkeen -auto on </dev/null >>"$INSTALL_LOG" 2>&1 || true
-/opt/sbin/xkeen -restart </dev/null >>"$INSTALL_LOG" 2>&1 || warn "xkeen -restart вернул ошибку — подробности в $INSTALL_LOG"
+# Ручной повторный запуск включает VPN, а обновление (DXK_UPDATE=1 от
+# dropweb-xkeen-update.sh) оставляет его таким, каким его выключил человек.
+VPN_OFF=0
+if [ "${DXK_UPDATE:-}" = 1 ] && [ -f /opt/etc/mihomo/.disabled ]; then
+  VPN_OFF=1
+  inf "VPN выключен в панели — после обновления оставляю выключенным"
+  # xkeen -um/-mihomo выше могли поднять mihomo заново.
+  if pidof mihomo >/dev/null 2>&1; then /opt/sbin/mihomo-panic.sh >>"$INSTALL_LOG" 2>&1 || true; fi
+else
+  inf "Запускаю XKeen + mihomo..."
+  rm -f /opt/etc/mihomo/.disabled
+  /opt/sbin/xkeen -auto on </dev/null >>"$INSTALL_LOG" 2>&1 || true
+  /opt/sbin/xkeen -restart </dev/null >>"$INSTALL_LOG" 2>&1 || warn "xkeen -restart вернул ошибку — подробности в $INSTALL_LOG"
+fi
 
 inf "Запускаю веб-панель..."
 /opt/etc/init.d/S96mihomo-panel restart || warn "Веб-панель не запустилась — смотри /opt/var/log/mihomo-panel.log"
@@ -1151,42 +1509,48 @@ inf "Запускаю веб-панель..."
 # =============================================================================
 # Проверки
 # =============================================================================
-inf "Жду mihomo и его API (до 30 с)..."
 mihomo_pid=""
 api_ver=""
-i=0
-while [ "$i" -lt 15 ]; do
-  mihomo_pid=$(pidof mihomo 2>/dev/null || true)
-  if [ -n "$mihomo_pid" ]; then
-    api_ver=$(curl -s --max-time 3 -H "Authorization: Bearer $API_SECRET" "http://127.0.0.1:$API_PORT/version" 2>/dev/null || true)
-    case "$api_ver" in *version*) break ;; esac
-  fi
-  sleep 2
-  i=$((i + 1))
-done
+if [ "$VPN_OFF" = 0 ]; then
+  inf "Жду mihomo и его API (до 30 с)..."
+  i=0
+  while [ "$i" -lt 15 ]; do
+    mihomo_pid=$(pidof mihomo 2>/dev/null || true)
+    if [ -n "$mihomo_pid" ]; then
+      api_ver=$(curl -s --max-time 3 -H "Authorization: Bearer $API_SECRET" "http://127.0.0.1:$API_PORT/version" 2>/dev/null || true)
+      case "$api_ver" in *version*) break ;; esac
+    fi
+    sleep 2
+    i=$((i + 1))
+  done
+fi
 
 say ""
 hdr "========== ИТОГ =========="
-[ -n "$mihomo_pid" ] || die "mihomo не поднялся — смотри /opt/var/log/dropweb-xkeen-install.log и \`xkeen -diag\`"
-ok "mihomo: pid $mihomo_pid"
-case "$api_ver" in
-  *version*) ok "API mihomo: $api_ver" ;;
-  *) warn "API mihomo на порту $API_PORT не ответил${api_ver:+: $api_ver}" ;;
-esac
-
-if iptables -w -t mangle -S 2>/dev/null | grep -q -- '-j xkeen' || iptables -w -t nat -S 2>/dev/null | grep -q -- '-j xkeen'; then
-  ok "Перехват трафика XKeen (iptables) активен"
+if [ "$VPN_OFF" = 1 ]; then
+  warn "VPN выключен в панели: интернет идёт напрямую, включить можно там же"
 else
-  warn "Правила XKeen в iptables не видны — проверь xkeen -diag"
-fi
+  [ -n "$mihomo_pid" ] || die "mihomo не поднялся — смотри /opt/var/log/dropweb-xkeen-install.log и \`xkeen -diag\`"
+  ok "mihomo: pid $mihomo_pid"
+  case "$api_ver" in
+    *version*) ok "API mihomo: $api_ver" ;;
+    *) warn "API mihomo на порту $API_PORT не ответил${api_ver:+: $api_ver}" ;;
+  esac
 
-mixed_port=$(/opt/sbin/yq '."mixed-port" // ""' "$CONF" 2>/dev/null || true)
-if [ -n "$mixed_port" ]; then
-  http_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -x "http://127.0.0.1:$mixed_port" https://www.gstatic.com/generate_204 2>/dev/null || true)
-  if [ "$http_code" = "204" ]; then
-    ok "Выход в интернет через mihomo работает"
+  if iptables -w -t mangle -S 2>/dev/null | grep -q -- '-j xkeen' || iptables -w -t nat -S 2>/dev/null | grep -q -- '-j xkeen'; then
+    ok "Перехват трафика XKeen (iptables) активен"
   else
-    warn "Проверка выхода через mihomo не прошла (http=${http_code:-нет ответа}) — возможно, сервер ещё подключается"
+    warn "Правила XKeen в iptables не видны — проверь xkeen -diag"
+  fi
+
+  mixed_port=$(/opt/sbin/yq '."mixed-port" // ""' "$CONF" 2>/dev/null || true)
+  if [ -n "$mixed_port" ]; then
+    http_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -x "http://127.0.0.1:$mixed_port" https://www.gstatic.com/generate_204 2>/dev/null || true)
+    if [ "$http_code" = "204" ]; then
+      ok "Выход в интернет через mihomo работает"
+    else
+      warn "Проверка выхода через mihomo не прошла (http=${http_code:-нет ответа}) — возможно, сервер ещё подключается"
+    fi
   fi
 fi
 
@@ -1213,7 +1577,13 @@ say ""
 say "  Веб-панель:          http://$LAN_IP:$PANEL_PORT/"
 say "                       VPN вкл/выкл, проверка связи, срок подписки,"
 say "                       «Обновить подписку», смена ссылки, лимит устройств,"
-say "                       «Обновить панель» — новая версия панели с GitHub"
+say "                       «Обновление» — версия, автообновление, «Обновить сейчас»"
+if [ "$AUTO_UPDATE" = 1 ]; then
+  say "  Обновления:          сами, ночью с GitHub; если новая версия не заработает,"
+  say "                       роутер вернёт прежнюю (лог: /opt/var/log/dropweb-xkeen-update.log)"
+else
+  say "  Обновления:          только кнопкой в панели (AUTO_UPDATE=0)"
+fi
 say "  Дашборд mihomo:      http://$LAN_IP:$API_PORT/ui/"
 say "                       адрес API http://$LAN_IP:$API_PORT, секрет: $API_SECRET"
 say "  Вход в дашборд сразу:"
