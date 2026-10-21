@@ -23,6 +23,9 @@
 #       в панели. /opt/sbin/dropweb-xkeen-update.sh запускает install.sh новой
 #       версии и, если после него VPN или панель не работают, возвращает
 #       прежнюю версию из снимка
+#    9. Пускает игры и прочий UDP мимо mihomo: в него идёт только UDP, который
+#       правила подписки могут отправить в VPN (QUIC, звонки Telegram,
+#       WhatsApp, Discord, Meet), остальной — обычным NAT (UDP_BYPASS=1)
 #
 #  Использование (на роутере по SSH под root):
 #     curl -fsSL -o /tmp/install.sh https://raw.githubusercontent.com/enkinvsh/dropweb-xkeen/main/install.sh
@@ -38,7 +41,7 @@
 
 set -eu
 
-DROPWEB_XKEEN_VERSION="2.3.2"
+DROPWEB_XKEEN_VERSION="2.4.0"
 SCRIPT_VERSION=$DROPWEB_XKEEN_VERSION
 
 # XKeen иначе уходит в фон и сразу возвращает 0 — нам нужен честный код возврата.
@@ -57,6 +60,9 @@ LEGACY_PANEL=/opt/sbin/mihomo-panel.py
 PANEL_DIR=/opt/share/dropweb-xkeen/panel
 DEFAULT_UPDATE_URL=https://raw.githubusercontent.com/enkinvsh/dropweb-xkeen/main
 SELF_UPDATER=/opt/sbin/dropweb-xkeen-update.sh
+UDP_BYPASS_SH=/opt/sbin/dropweb-udp-bypass.sh
+# «zz-»: ndm запускает хуки по алфавиту, наш должен идти после proxy.sh XKeen.
+UDP_HOOK=/opt/etc/ndm/netfilter.d/zz-dropweb-udp.sh
 XKEEN_INIT=/opt/etc/init.d/S05xkeen
 CONF=/opt/etc/mihomo/config.yaml
 PRECHECK_FILE=/tmp/dropweb-sub-check.$$
@@ -130,6 +136,8 @@ dropweb-xkeen — VPN dropweb на Keenetic через XKeen 2 + mihomo
   UPDATE_URL      откуда брать обновления и файлы панели: raw-адрес ветки
                   (https://raw.githubusercontent.com/enkinvsh/dropweb-xkeen/main)
   AUTO_UPDATE     1 — обновляться самому ночью (по умолчанию), 0 — только кнопкой
+  UDP_BYPASS      1 — UDP, который подписка не шлёт в VPN (игры), мимо mihomo
+                  (по умолчанию), 0 — весь UDP через mihomo, как до 2.4.0
   ASSUME_YES=1    то же, что -y
 
 Пример:
@@ -176,10 +184,11 @@ ENV_API_SECRET=${API_SECRET:-}
 ENV_LAN_IP=${LAN_IP:-}
 ENV_UPDATE_URL=${UPDATE_URL:-}
 ENV_AUTO_UPDATE=${AUTO_UPDATE:-}
+ENV_UDP_BYPASS=${UDP_BYPASS:-}
 
 SUB_URL=""; HWID=""; DEVICE_OS=""; OS_VERSION=""; DEVICE_MODEL=""
 USER_AGENT_HDR=""; PANEL_PORT=""; API_PORT=""; API_SECRET=""; LAN_IP=""
-UPDATE_URL=""; AUTO_UPDATE=""; PANEL_SOURCE=""
+UPDATE_URL=""; AUTO_UPDATE=""; PANEL_SOURCE=""; UDP_BYPASS=""
 
 SETTINGS_ORIGIN="новая установка"
 if [ -f "$SETTINGS_FILE" ]; then
@@ -224,6 +233,7 @@ DROPWEB_XKEEN_VERSION=$SCRIPT_VERSION
 [ -z "$ENV_LAN_IP" ]         || LAN_IP=$ENV_LAN_IP
 [ -z "$ENV_UPDATE_URL" ]     || UPDATE_URL=$ENV_UPDATE_URL
 [ -z "$ENV_AUTO_UPDATE" ]    || AUTO_UPDATE=$ENV_AUTO_UPDATE
+[ -z "$ENV_UDP_BYPASS" ]     || UDP_BYPASS=$ENV_UDP_BYPASS
 # 2.1.x хранила только адрес панели (PANEL_SOURCE=<ветка>/panel): адрес ветки — на уровень выше.
 if [ -z "$UPDATE_URL" ]; then
   case "$PANEL_SOURCE" in http://?*/panel|https://?*/panel) UPDATE_URL=${PANEL_SOURCE%/panel} ;; esac
@@ -294,6 +304,7 @@ fi
 [ -n "$UPDATE_URL" ]     || UPDATE_URL=$DEFAULT_UPDATE_URL
 UPDATE_URL=${UPDATE_URL%/}
 [ "$AUTO_UPDATE" = 0 ]   || AUTO_UPDATE=1
+[ "$UDP_BYPASS" = 0 ]    || UDP_BYPASS=1
 
 case "$PANEL_PORT" in ''|*[!0-9]*) die "PANEL_PORT должен быть числом (сейчас: $PANEL_PORT)" ;; esac
 case "$UPDATE_URL" in http://?*|https://?*) ;; *) die "UPDATE_URL должен быть адресом http(s):// (сейчас: $UPDATE_URL)" ;; esac
@@ -350,6 +361,11 @@ if [ "$AUTO_UPDATE" = 1 ]; then
 else
   say "  обновления   : только кнопкой в панели ($UPDATE_URL)"
 fi
+if [ "$UDP_BYPASS" = 1 ]; then
+  say "  UDP          : в mihomo только то, что подписка шлёт в VPN, игры напрямую"
+else
+  say "  UDP          : весь через mihomo (UDP_BYPASS=0)"
+fi
 say "  (любой параметр можно задать переменной окружения, см. sh install.sh -h)"
 say ""
 
@@ -381,6 +397,7 @@ save_settings() {
       printf 'LAN_IP=%s\n' "$(shq "$LAN_IP")"
       printf 'UPDATE_URL=%s\n' "$(shq "$UPDATE_URL")"
       printf 'AUTO_UPDATE=%s\n' "$(shq "$AUTO_UPDATE")"
+      printf 'UDP_BYPASS=%s\n' "$(shq "$UDP_BYPASS")"
     } >"$ss_tmp"
   )
   chmod 600 "$ss_tmp"
@@ -749,6 +766,10 @@ if pidof mihomo >/dev/null 2>&1 && [ ! -f "$CONF_DIR/.disabled" ]; then
       ;;
   esac
 fi
+# В новом конфиге могут быть другие IP-правила — пересобираем обход UDP.
+if [ -x /opt/sbin/dropweb-udp-bypass.sh ]; then
+  /opt/sbin/dropweb-udp-bypass.sh build >>"$LOG" 2>&1
+fi
 
 finish updated 0
 EOF_UPDATER
@@ -769,6 +790,11 @@ LOCK=/tmp/mihomo-watchdog.lock
 # Во время обновления mihomo перезапускает install.sh — не мешаем ему.
 [ -d /tmp/dxk-update.lock ] && exit 0
 grep -Eq '^[[:space:]]*start_auto="on"' /opt/etc/init.d/S05xkeen 2>/dev/null || exit 0
+# Обход UDP: XKeen стирает наше правило, когда пересобирает свои цепочки,
+# а списки меняются вместе с подпиской.
+if [ -x /opt/sbin/dropweb-udp-bypass.sh ]; then
+  /opt/sbin/dropweb-udp-bypass.sh check >/dev/null 2>&1
+fi
 pidof mihomo >/dev/null 2>&1 && exit 0
 # Дать S05xkeen спокойно отработать при загрузке роутера.
 uptime_s=$(cut -d. -f1 /proc/uptime)
@@ -924,6 +950,9 @@ while [ "$i" -lt 10 ]; do
   i=$((i + 1))
 done
 
+if [ -n "$mpid" ] && [ -x /opt/sbin/dropweb-udp-bypass.sh ]; then
+  /opt/sbin/dropweb-udp-bypass.sh apply >/dev/null 2>&1
+fi
 if [ -n "$mpid" ]; then
   echo "VPN включён: mihomo pid $mpid"
   printf '[%s] RESUME: mihomo pid %s\n' "$(date '+%F %T')" "$mpid" >>"$LOG"
@@ -981,7 +1010,8 @@ SNAP_PATHS="/opt/sbin/update-mihomo-sub.sh /opt/sbin/mihomo-watchdog.sh /opt/sbi
 /opt/sbin/mihomo-resume.sh /opt/sbin/mihomo-vpn-uninstall.sh /opt/sbin/dropweb-xkeen-update.sh
 /opt/sbin/mihomo /opt/etc/init.d/S05xkeen /opt/etc/init.d/S96mihomo-panel /opt/share/dropweb-xkeen
 /opt/etc/dropweb-xkeen/settings.env /opt/etc/dropweb-xkeen/sub-state.env $CONF
-/opt/etc/mihomo/.disabled /opt/var/spool/cron/crontabs/root"
+/opt/etc/mihomo/.disabled /opt/var/spool/cron/crontabs/root
+/opt/sbin/dropweb-udp-bypass.sh /opt/etc/ndm/netfilter.d/zz-dropweb-udp.sh"
 
 mkdir -p /opt/var/log
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
@@ -1175,6 +1205,9 @@ restore() {
     xkeen -auto on </dev/null >>"$LOG" 2>&1
     xkeen -restart </dev/null >>"$LOG" 2>&1
   fi
+  if [ -x /opt/sbin/dropweb-udp-bypass.sh ]; then
+    /opt/sbin/dropweb-udp-bypass.sh build >>"$LOG" 2>&1
+  fi
   /opt/etc/init.d/S96mihomo-panel restart >>"$LOG" 2>&1
   # shellcheck source=/dev/null
   . "$SETTINGS"
@@ -1357,6 +1390,567 @@ esac
 EOF_PANEL_INIT
 }
 
+write_udp_bypass() {
+cat >"$UDP_BYPASS_SH" <<'EOF_UDPBYPASS'
+#!/opt/bin/sh
+# dropweb-xkeen: игры и прочий UDP мимо mihomo.
+# XKeen заворачивает в mihomo весь UDP из домашней сети, даже тот, который
+# правила подписки отправляют напрямую. Для игр это лишний круг через
+# прокси-процесс: у PS5 на Hopper 2026-10-21 пинг EA FC был 150–200 вместо
+# 80–100, хотя mihomo и так вёл игру DIRECT.
+# Поэтому в mihomo идёт только UDP, который правила подписки могут отправить
+# не напрямую: на порты QUIC из sniffer (443) и на адреса из IP-правил
+# с VPN-целью (звонки Telegram, WhatsApp, Discord, Meet). Остальной UDP
+# выходит из цепочки xkeen и уходит обычным NAT. TCP не трогаем.
+# Списки строятся из конфига mihomo и файлов его rule-provider. Если правило
+# нельзя свести к адресам и портам (MATCH в VPN, NOT, GEOIP…), обход
+# выключается и весь UDP, как раньше, идёт в mihomo.
+#   build   пересобрать списки и применить
+#   apply   вернуть правило (XKeen стирает цепочку xkeen при каждой пересборке)
+#   check   watchdog: пересобрать, если конфиг или списки поменялись; вернуть правило
+#   remove  снять правило и наборы (удаление dropweb-xkeen)
+#   status  что сейчас включено
+# UDP_BYPASS=0 в settings.env — весь UDP через mihomo.
+set -u
+PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin; export PATH
+SETTINGS=/opt/etc/dropweb-xkeen/settings.env
+DIR=/opt/etc/dropweb-xkeen/udp-bypass
+STATE=$DIR/state.env
+MDIR=/opt/etc/mihomo
+CONF=$MDIR/config.yaml
+LOG=/opt/var/log/dropweb-udp-bypass.log
+LOCK=/tmp/dxk-udp.lock
+TAG=dropweb_udp_bypass
+
+mkdir -p "$DIR" /opt/var/log
+log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+if [ -f "$LOG" ] && [ "$(wc -c <"$LOG")" -gt 131072 ]; then
+  tail -n 300 "$LOG" >"$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+fi
+
+UDP_BYPASS=1
+if [ -f "$SETTINGS" ]; then
+  # shellcheck source=/dev/null
+  . "$SETTINGS"
+fi
+: "${UDP_BYPASS:=1}"
+
+# $1 — сколько секунд ждать чужой запуск.
+take_lock() {
+  n=0
+  while ! mkdir "$LOCK" 2>/dev/null; do
+    p=$(cat "$LOCK/pid" 2>/dev/null)
+    if [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; then rm -rf "$LOCK"; continue; fi
+    if [ "$n" -ge "$1" ]; then
+      # Пустой pid дольше ожидания — запуск умер между mkdir и записью pid.
+      [ -z "$p" ] && [ "$n" -gt 0 ] && { rm -rf "$LOCK"; continue; }
+      return 1
+    fi
+    n=$((n + 1)); sleep 1
+  done
+  echo $$ >"$LOCK/pid"
+  trap 'rm -rf "$LOCK"' EXIT
+  trap 'exit 1' INT TERM
+}
+
+ipt_of() { if [ "$1" = 6 ]; then echo ip6tables; else echo iptables; fi; }
+
+# Наше правило встаёт перед socket --transparent (иначе перед TPROXY):
+# так UDP мимо mihomo не получает метку XKeen.
+rule_pos() {
+  "$1" -w -t mangle -S xkeen 2>/dev/null | awk '
+    /^-A / { n++ }
+    /^-A / && /--transparent/ && !s { s = n }
+    /^-A / && /-j TPROXY/ && !t { t = n }
+    END { if (s) print s; else if (t) print t }'
+}
+
+drop_rules() {
+  "$1" -w -t mangle -S xkeen 2>/dev/null | grep -- "$TAG" | sed 's/^-A /-D /' | while read -r r; do
+    # shellcheck disable=SC2086 # r — список аргументов iptables
+    "$1" -w -t mangle $r 2>/dev/null
+  done
+}
+
+# Потоки, уже идущие через mihomo, сбрасываем так же, как XKeen после
+# пересборки: по метке TPROXY. Иначе они висят до таймаута conntrack.
+flush_udp() {
+  command -v conntrack >/dev/null 2>&1 || return 0
+  m=$("$1" -w -t mangle -S xkeen 2>/dev/null | sed -n 's/.*--tproxy-mark \(0x[0-9a-fA-F]*\).*/\1/p' | head -n1)
+  [ -n "$m" ] || return 0
+  if [ "$1" = ip6tables ]; then
+    conntrack -D -f ipv6 -p udp -m "$((m))" >/dev/null 2>&1
+  else
+    conntrack -D -p udp -m "$((m))" >/dev/null 2>&1
+  fi
+  return 0
+}
+
+want_on() {
+  [ "$UDP_BYPASS" != 0 ] || return 1
+  [ ! -f "$MDIR/.disabled" ] || return 1
+  [ -f "$STATE" ] && grep -q "^UDPB_ON='1'" "$STATE"
+}
+
+load_set() {
+  set=dxk_udp_vpn$1; lst=$DIR/v$1.lst; mark=/tmp/dxk-udp.set$1
+  fam=inet; [ "$1" = 6 ] && fam=inet6
+  [ -f "$lst" ] || : >"$lst"
+  sum=$(md5sum "$lst" | cut -d' ' -f1)
+  if ipset list -n "$set" >/dev/null 2>&1 && [ "$(cat "$mark" 2>/dev/null)" = "$sum" ]; then
+    return 0
+  fi
+  ipset create "$set" hash:net family "$fam" maxelem 262144 -exist || return 1
+  ipset destroy "${set}_new" 2>/dev/null
+  ipset create "${set}_new" hash:net family "$fam" maxelem 262144 || return 1
+  if [ -s "$lst" ] && ! sed "s/^/add ${set}_new /" "$lst" | ipset restore -exist; then
+    ipset destroy "${set}_new"
+    return 1
+  fi
+  ipset swap "${set}_new" "$set" && ipset destroy "${set}_new"
+  echo "$sum" >"$mark"
+}
+
+# Аргументы правила: UDP не на адреса из набора и не на порты из списка — RETURN.
+# В одном multiport не больше 15 портов (диапазон считается за два).
+rule_args() {
+  a="-p udp -m set ! --match-set dxk_udp_vpn$1 dst"
+  chunk=""; w=0
+  if [ -f "$DIR/ports" ]; then
+    while read -r p; do
+      [ -n "$p" ] || continue
+      pw=1; case "$p" in *:*) pw=2 ;; esac
+      if [ $((w + pw)) -gt 15 ]; then a="$a -m multiport ! --dports $chunk"; chunk=""; w=0; fi
+      chunk=${chunk:+$chunk,}$p; w=$((w + pw))
+    done <"$DIR/ports"
+  fi
+  [ -z "$chunk" ] || a="$a -m multiport ! --dports $chunk"
+  printf '%s -m comment --comment %s -j RETURN' "$a" "$TAG"
+}
+
+apply_fam() {
+  ipt=$(ipt_of "$1"); mark=/tmp/dxk-udp.rule$1
+  command -v "$ipt" >/dev/null 2>&1 || return 0
+  # Цепочки нет: VPN выключен или XKeen ещё не поднялся — потом вызовет хук.
+  "$ipt" -w -t mangle -S xkeen 2>/dev/null | grep -q -- '-j TPROXY' || return 0
+  if ! want_on; then
+    if "$ipt" -w -t mangle -S xkeen 2>/dev/null | grep -q -- "$TAG"; then
+      drop_rules "$ipt"; log "$ipt: обход UDP снят, весь UDP через mihomo"
+    fi
+    rm -f "$mark"
+    return 0
+  fi
+  if ! load_set "$1"; then
+    log "$ipt: набор dxk_udp_vpn$1 не загрузился — весь UDP через mihomo"
+    drop_rules "$ipt"; rm -f "$mark"
+    return 1
+  fi
+  args=$(rule_args "$1")
+  if "$ipt" -w -t mangle -S xkeen 2>/dev/null | grep -q -- "$TAG" && [ "$(cat "$mark" 2>/dev/null)" = "$args" ]; then
+    return 0
+  fi
+  drop_rules "$ipt"
+  pos=$(rule_pos "$ipt")
+  if [ -z "$pos" ]; then
+    log "$ipt: в цепочке xkeen нет правила TPROXY — обход UDP не ставлю"
+    return 1
+  fi
+  # shellcheck disable=SC2086 # args — список аргументов iptables
+  if "$ipt" -w -t mangle -I xkeen "$pos" $args; then
+    printf '%s' "$args" >"$mark"
+    flush_udp "$ipt"
+    log "$ipt: обход UDP на месте (перед правилом $pos)"
+  else
+    log "$ipt: не смог вставить правило обхода UDP"
+    return 1
+  fi
+}
+
+apply_all() {
+  rc=0
+  apply_fam 4 || rc=1
+  apply_fam 6 || rc=1
+  return "$rc"
+}
+
+need_build() {
+  [ -f "$STATE" ] || return 0
+  [ -n "$(find "$CONF" "$MDIR/rule-sets" "$MDIR/rules" -newer "$STATE" 2>/dev/null | head -n1)" ]
+}
+
+write_off() {
+  : >"$DIR/v4.lst"; : >"$DIR/v6.lst"; : >"$DIR/ports"
+  r=$(printf '%s' "$1" | sed "s/'/'\\\\''/g")
+  printf "UDPB_ON='0'\nUDPB_REASON='%s'\nUDPB_AT='%s'\n" "$r" "$(date +%s)" >"$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+  log "обход UDP выключен: $1"
+}
+
+build() {
+  if ! command -v python3 >/dev/null 2>&1; then write_off "нет python3"; return 0; fi
+  if [ ! -f "$CONF" ]; then write_off "нет $CONF"; return 0; fi
+  if ! python3 - "$CONF" "$MDIR" "$DIR" >>"$LOG" 2>&1 <<'EOF_PY'
+import hashlib, ipaddress, json, os, subprocess, sys, time
+
+CONF, HOME, OUT = sys.argv[1:4]
+DOMAIN_TYPES = {"DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "DOMAIN-REGEX", "DOMAIN-WILDCARD", "GEOSITE"}
+PROCESS_TYPES = {"PROCESS-NAME", "PROCESS-NAME-REGEX", "PROCESS-NAME-WILDCARD", "PROCESS-PATH",
+                 "PROCESS-PATH-REGEX", "PROCESS-PATH-WILDCARD", "UID"}
+
+
+class Cond:
+    """Где условие правила может сработать для UDP из домашней сети.
+
+    all — причина, по которой границ нет (сработает где угодно);
+    иначе только на адресах nets или портах ports. Пустое = никогда.
+    """
+
+    __slots__ = ("all", "nets", "ports")
+
+    def __init__(self, all_=None, nets=(), ports=()):
+        self.all = all_
+        self.nets = set(nets)
+        self.ports = set(ports)
+
+    def never(self):
+        return self.all is None and not self.nets and not self.ports
+
+
+def run(args):
+    return subprocess.run(args, capture_output=True, text=True, timeout=120)
+
+
+def yq_json(path, expr="."):
+    r = run(["yq", "-o=json", expr, path])
+    if r.returncode:
+        raise RuntimeError("yq: " + (r.stderr.strip() or path)[:150])
+    return json.loads(r.stdout or "null")
+
+
+def split(s):
+    out, depth, cur = [], 0, []
+    for ch in s:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    out.append("".join(cur).strip())
+    return out
+
+
+def unwrap(s):
+    s = s.strip()
+    return s[1:-1].strip() if s.startswith("(") and s.endswith(")") else s
+
+
+def ports_of(spec):
+    res = set()
+    for part in str(spec).replace(",", "/").split("/"):
+        part = part.strip()
+        if not part:
+            continue
+        a, _, b = part.partition("-")
+        lo, hi = int(a), int(b or a)
+        if not 0 < lo <= hi <= 65535:
+            raise ValueError("порт " + part)
+        res.add((lo, hi))
+    return res
+
+
+def net(s):
+    return ipaddress.ip_network(str(s).strip().strip("'\""), strict=False)
+
+
+def nets_cond(items, what):
+    out = Cond()
+    for it in items:
+        n = net(it)
+        if n.prefixlen == 0:
+            return Cond(all_=what + ": " + str(n))
+        out.nets.add(n)
+    return out
+
+
+def any_of(kids):
+    out = Cond()
+    for k in kids:
+        if k.all is not None:
+            return Cond(all_=k.all)
+        out.nets |= k.nets
+        out.ports |= k.ports
+    return out
+
+
+def all_of(kids):
+    # Любое из условий AND — надмножество всего AND: берём самое узкое.
+    if any(k.never() for k in kids):
+        return Cond()
+    bounded = [k for k in kids if k.all is None]
+    if not bounded:
+        return Cond(all_=kids[0].all)
+
+    def cost(k):
+        if not k.nets and k.ports <= BASE_PORTS:
+            return 0  # эти порты и так идут в mihomo
+        if not k.ports:
+            return 1
+        return 3 if not k.nets else 2
+
+    return min(bounded, key=cost)
+
+
+def clean(items):
+    out = []
+    for it in items:
+        s = str(it).strip()
+        if s and not s.startswith("#"):
+            out.append(s.strip("'\""))
+    return out
+
+
+def domain():
+    # Домен у UDP с адресом вместо имени mihomo узнаёт только sniffer-ом QUIC
+    # или из своего DNS. Fake-ip DNS закрыт набором fake-ip-range, а redir-host,
+    # раздающий адреса в сеть, сопоставит домен с любым портом.
+    if DNS_LEAKS_DOMAINS:
+        return Cond(all_="DNS mihomo в режиме " + DNS_MODE + " слушает сеть")
+    return Cond(ports=BASE_PORTS) if BASE_PORTS else Cond()
+
+
+PROV_CACHE = {}
+
+
+def provider(name):
+    if name not in PROV_CACHE:
+        PROV_CACHE[name] = Cond(all_="rule-provider " + name + " ссылается сам на себя")
+        p = PROVIDERS.get(name)
+        PROV_CACHE[name] = provider_eval(name, p) if isinstance(p, dict) else Cond(all_="нет rule-provider " + name)
+    return PROV_CACHE[name]
+
+
+def provider_items(name, p, beh):
+    if str(p.get("type", "")).lower() == "inline":
+        return clean(p.get("payload") or [])
+    path = p.get("path") or os.path.join("rules", hashlib.md5(str(p.get("url", "")).encode()).hexdigest())
+    full = path if os.path.isabs(path) else os.path.normpath(os.path.join(HOME, path))
+    if not os.path.isfile(full):
+        return Cond(all_="список " + name + " ещё не скачан")
+    fmt = str(p.get("format") or "yaml").lower()
+    if fmt == "mrs":
+        tmp = os.path.join(OUT, ".mrs.txt")
+        r = run(["mihomo", "convert-ruleset", beh, "mrs", full, tmp])
+        if r.returncode or not os.path.isfile(tmp):
+            return Cond(all_="не прочитал список " + name)
+        with open(tmp, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+        os.remove(tmp)
+        return clean(lines)
+    if fmt == "text":
+        with open(full, encoding="utf-8", errors="replace") as f:
+            return clean(f.read().splitlines())
+    return clean(yq_json(full, ".payload // []") or [])
+
+
+def provider_eval(name, p):
+    beh = str(p.get("behavior") or "classical").lower()
+    if beh == "domain":
+        return domain()
+    items = provider_items(name, p, beh)
+    if isinstance(items, Cond):
+        return items
+    if beh == "ipcidr":
+        return nets_cond(items, name)
+    return any_of([cond(it) for it in items])
+
+
+def cond(text):
+    parts = split(text)
+    t = parts[0].upper()
+    arg = parts[1] if len(parts) > 1 else ""
+    if t in ("AND", "OR", "NOT"):
+        kids = [cond(unwrap(k)) for k in split(unwrap(arg)) if unwrap(k)]
+        if t == "NOT" or not kids:
+            return Cond(all_=t)
+        return any_of(kids) if t == "OR" else all_of(kids)
+    if t in DOMAIN_TYPES:
+        return domain()
+    if t in PROCESS_TYPES:
+        # Процесс находится только у программ самого роутера, не у устройств сети.
+        return Cond() if PROCESS_OFF else Cond(all_=t)
+    if t in ("IP-CIDR", "IP-CIDR6"):
+        return nets_cond([arg], t)
+    if t == "DST-PORT":
+        return Cond(ports=ports_of(arg))
+    if t == "NETWORK":
+        return Cond() if arg.lower() == "tcp" else Cond(all_="NETWORK," + arg)
+    if t == "RULE-SET":
+        return provider(arg)
+    return Cond(all_=t)
+
+
+def direct(target, seen=()):
+    if target in ("DIRECT", "PASS", "COMPATIBLE"):
+        return True
+    g = GROUPS.get(target)
+    if not g or target in seen:
+        return False
+    if any(g.get(k) for k in ("use", "include-all", "include-all-proxies", "include-all-providers")):
+        return False
+    ps = g.get("proxies") or []
+    return bool(ps) and all(direct(p, seen + (target,)) for p in ps)
+
+
+def q(v):
+    return "'" + str(v).replace("'", "'\\''") + "'"
+
+
+def write(name, text):
+    tmp = os.path.join(OUT, "." + name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, os.path.join(OUT, name))
+
+
+def save(on, reason="", v4=(), v6=(), ports=()):
+    write("v4.lst", "".join(x + "\n" for x in v4))
+    write("v6.lst", "".join(x + "\n" for x in v6))
+    write("ports", "".join(x + "\n" for x in ports))
+    write("state.env", "".join(k + "=" + q(v) + "\n" for k, v in (
+        ("UDPB_ON", 1 if on else 0), ("UDPB_REASON", reason), ("UDPB_V4", len(v4)),
+        ("UDPB_V6", len(v6)), ("UDPB_PORTS", ",".join(ports)), ("UDPB_AT", int(time.time())))))
+    if on:
+        print("обход UDP: в mihomo только порты", ",".join(ports) or "—", "и", len(v4), "+", len(v6), "сетей")
+    else:
+        print("обход UDP выключен:", reason)
+
+
+def short(rule):
+    rule = str(rule)
+    return rule if len(rule) <= 90 else rule[:87] + "…"
+
+
+def main():
+    global BASE_PORTS, PROCESS_OFF, PROVIDERS, GROUPS, DNS_LEAKS_DOMAINS, DNS_MODE
+    cfg = yq_json(CONF) or {}
+    sn = cfg.get("sniffer") or {}
+    BASE_PORTS = set()
+    quic = (sn.get("sniff") or {}).get("QUIC") if sn.get("enable") else None
+    if isinstance(quic, dict):
+        for x in quic.get("ports") or []:
+            BASE_PORTS |= ports_of(x)
+    PROCESS_OFF = str(cfg.get("find-process-mode", "")).lower() == "off"
+    PROVIDERS = cfg.get("rule-providers") or {}
+    GROUPS = {g.get("name"): g for g in cfg.get("proxy-groups") or [] if isinstance(g, dict)}
+    dns = cfg.get("dns") or {}
+    DNS_MODE = str(dns.get("enhanced-mode") or "redir-host").lower()
+    listen = str(dns.get("listen") or "")
+    local = listen == "" or listen.startswith(("127.", "localhost", "[::1]", "::1"))
+    DNS_LEAKS_DOMAINS = bool(dns.get("enable")) and DNS_MODE != "fake-ip" and not local
+
+    nets, ports = set(), set(BASE_PORTS)
+    if dns.get("enable") and DNS_MODE == "fake-ip":
+        nets.add(net(dns.get("fake-ip-range") or "198.18.0.1/16"))
+        if dns.get("fake-ip-range6"):
+            nets.add(net(dns["fake-ip-range6"]))
+    for rule in cfg.get("rules") or []:
+        parts = split(str(rule))
+        t = parts[0].upper()
+        if t == "MATCH":
+            target, c = (parts[1] if len(parts) > 1 else ""), Cond(all_="MATCH")
+        elif len(parts) >= 3:
+            target, c = parts[2], None
+        else:
+            continue
+        if direct(target):
+            continue
+        if c is None:
+            c = cond(",".join(parts[:2]))
+        if c.all is not None:
+            return save(False, "правило «" + short(rule) + "» (" + c.all + ") может отправить в VPN любой UDP")
+        nets |= c.nets
+        ports |= c.ports
+
+    v4 = [str(n) for n in ipaddress.collapse_addresses(sorted(n for n in nets if n.version == 4))]
+    v6 = [str(n) for n in ipaddress.collapse_addresses(sorted(n for n in nets if n.version == 6))]
+    merged = []
+    for lo, hi in sorted(ports):
+        if merged and lo <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    return save(True, "", v4, v6, [str(lo) if lo == hi else "%d:%d" % (lo, hi) for lo, hi in merged])
+
+
+try:
+    main()
+except Exception as e:  # любой сбой разбора — весь UDP через mihomo, как раньше
+    save(False, "не разобрал конфиг: %s: %s" % (type(e).__name__, str(e)[:150]))
+EOF_PY
+  then
+    write_off "python3 завершился с ошибкой"
+  fi
+}
+
+case "${1:-}" in
+  build)
+    take_lock 60 || exit 0
+    build
+    apply_all
+    ;;
+  apply)
+    # Хук ndm не держим: идущий build сам применит правило в конце.
+    take_lock 5 || exit 0
+    apply_all
+    ;;
+  check)
+    take_lock 0 || exit 0
+    if need_build; then build; fi
+    apply_all
+    ;;
+  remove)
+    take_lock 30 || true
+    for f in 4 6; do
+      ipt=$(ipt_of "$f")
+      command -v "$ipt" >/dev/null 2>&1 && drop_rules "$ipt"
+      ipset destroy "dxk_udp_vpn$f" 2>/dev/null
+      ipset destroy "dxk_udp_vpn${f}_new" 2>/dev/null
+    done
+    rm -f /tmp/dxk-udp.set4 /tmp/dxk-udp.set6 /tmp/dxk-udp.rule4 /tmp/dxk-udp.rule6
+    ;;
+  status)
+    if [ -f "$STATE" ]; then cat "$STATE"; else echo "списки ещё не собраны"; fi
+    [ "$UDP_BYPASS" != 0 ] || echo "UDP_BYPASS=0 в $SETTINGS: весь UDP через mihomo"
+    for f in 4 6; do
+      ipt=$(ipt_of "$f")
+      command -v "$ipt" >/dev/null 2>&1 || continue
+      "$ipt" -w -t mangle -S xkeen 2>/dev/null | grep -- "$TAG" || echo "$ipt: правила обхода нет"
+    done
+    ;;
+  *)
+    echo "Использование: dropweb-udp-bypass.sh build|apply|check|remove|status" >&2
+    exit 2
+    ;;
+esac
+exit 0
+EOF_UDPBYPASS
+}
+
+write_udp_hook() {
+mkdir -p "$(dirname "$UDP_HOOK")"
+cat >"$UDP_HOOK" <<'EOF_UDPHOOK'
+#!/bin/sh
+# dropweb-xkeen: XKeen (proxy.sh) пересобирает цепочку xkeen при каждом
+# обновлении netfilter и стирает правило обхода UDP — возвращаем его сразу.
+[ "${table:-}" = mangle ] || exit 0
+[ -x /opt/sbin/dropweb-udp-bypass.sh ] || exit 0
+exec /opt/sbin/dropweb-udp-bypass.sh apply >/dev/null 2>&1
+EOF_UDPHOOK
+}
+
 write_uninstall() {
 cat >/opt/sbin/mihomo-vpn-uninstall.sh <<'EOF_UNINSTALL'
 #!/opt/bin/sh
@@ -1367,6 +1961,7 @@ export XKEEN_FOREGROUND=1
 CRONTAB=/opt/var/spool/cron/crontabs/root
 
 echo "Выключаю VPN и удаляю dropweb-xkeen..."
+if [ -x /opt/sbin/dropweb-udp-bypass.sh ]; then /opt/sbin/dropweb-udp-bypass.sh remove; fi
 if [ -x /opt/sbin/mihomo-panic.sh ]; then /opt/sbin/mihomo-panic.sh; fi
 if [ -x /opt/etc/init.d/S96mihomo-panel ]; then /opt/etc/init.d/S96mihomo-panel stop; fi
 
@@ -1382,11 +1977,12 @@ done
 rm -f /opt/etc/init.d/S96mihomo-panel /opt/etc/init.d/S97mihomo \
   /opt/sbin/update-mihomo-sub.sh /opt/sbin/mihomo-start.sh /opt/sbin/mihomo-resume.sh /opt/sbin/mihomo-panic.sh \
   /opt/sbin/mihomo-panel.py /opt/sbin/mihomo-watchdog.sh /opt/sbin/dropweb-xkeen-update.sh \
+  /opt/sbin/dropweb-udp-bypass.sh /opt/etc/ndm/netfilter.d/zz-dropweb-udp.sh \
   /opt/etc/mihomo/config.yaml /opt/etc/mihomo/.sub.raw.yaml /opt/etc/mihomo/.config.new.yaml \
   /opt/etc/mihomo/.sub.headers \
   /opt/var/run/mihomo-panel.pid
 rm -rf /opt/etc/mihomo/zash /opt/backups/mihomo /opt/backups/dropweb-xkeen /opt/etc/dropweb-xkeen /opt/share/dropweb-xkeen
-rm -f /opt/var/log/mihomo-*.log /opt/var/log/dropweb-xkeen-update.log
+rm -f /opt/var/log/mihomo-*.log /opt/var/log/dropweb-xkeen-update.log /opt/var/log/dropweb-udp-bypass.log
 
 echo "Готово. XKeen и mihomo оставлены (автозапуск XKeen выключен). Удалить их полностью: xkeen -remove"
 rm -f "$0"
@@ -1400,10 +1996,12 @@ write_panic
 write_resume
 write_self_updater
 write_panel_init
+write_udp_bypass
+write_udp_hook
 write_uninstall
 chmod +x /opt/sbin/update-mihomo-sub.sh /opt/sbin/mihomo-watchdog.sh /opt/sbin/mihomo-panic.sh \
   /opt/sbin/mihomo-resume.sh /opt/etc/init.d/S96mihomo-panel \
-  /opt/sbin/mihomo-vpn-uninstall.sh "$SELF_UPDATER"
+  /opt/sbin/mihomo-vpn-uninstall.sh "$SELF_UPDATER" "$UDP_BYPASS_SH" "$UDP_HOOK"
 ok "Скрипты в /opt/sbin и /opt/etc/init.d/S96mihomo-panel"
 
 PANEL_FROM=""
@@ -1582,6 +2180,25 @@ if [ "$VPN_OFF" = 0 ]; then
   done
 fi
 
+# Обход UDP. Списки rule-provider mihomo качает после старта: на новой
+# установке ждём их до 30 с.
+UDPB_STATE=$SETTINGS_DIR/udp-bypass/state.env
+UDPB_REASON=""; UDPB_V4=0; UDPB_V6=0; UDPB_PORTS=""
+i=0
+while :; do
+  "$UDP_BYPASS_SH" build >>"$INSTALL_LOG" 2>&1 || true
+  if [ -f "$UDPB_STATE" ]; then
+    # shellcheck source=/dev/null
+    . "$UDPB_STATE"
+  fi
+  case "$UDPB_REASON" in
+    *"ещё не скачан"*) [ "$VPN_OFF" = 0 ] && [ "$i" -lt 6 ] || break ;;
+    *) break ;;
+  esac
+  i=$((i + 1))
+  sleep 5
+done
+
 say ""
 hdr "========== ИТОГ =========="
 if [ "$VPN_OFF" = 1 ]; then
@@ -1608,6 +2225,14 @@ else
     else
       warn "Проверка выхода через mihomo не прошла (http=${http_code:-нет ответа}) — возможно, сервер ещё подключается"
     fi
+  fi
+
+  if [ "$UDP_BYPASS" = 0 ]; then
+    ok "UDP: весь через mihomo (UDP_BYPASS=0)"
+  elif iptables -w -t mangle -S xkeen 2>/dev/null | grep -q dropweb_udp_bypass; then
+    ok "Игры и прочий UDP идут напрямую; в VPN — QUIC (порты $UDPB_PORTS) и звонки ($UDPB_V4 + $UDPB_V6 сетей)"
+  else
+    warn "Обход UDP не включился${UDPB_REASON:+: $UDPB_REASON} — весь UDP идёт через mihomo, как раньше"
   fi
 fi
 
