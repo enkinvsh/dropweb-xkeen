@@ -9,6 +9,7 @@ A single script turns a Keenetic router with Entware into a **transparent VPN ro
 ## What You Get
 
 - **Transparent VPN for selected devices** via [XKeen 2](https://github.com/jameszeroX/XKeen) + **mihomo** (Clash.Meta) with dropweb routing rules: both TCP and UDP from devices in the policy are intercepted at the router
+- **Games without extra ping** — only the UDP the subscription can route to the VPN (QUIC, Telegram/WhatsApp/Discord/Meet calls) enters mihomo; games and other UDP go direct. The router builds the list from the subscription itself, see [Games and Calls (UDP)](#games-and-calls-udp)
 - **Web panel** at `http://192.168.1.1:8181/` — no SSH for daily use: VPN on/off, connection check, subscription expiry, "Update subscription", change the subscription link. When the subscription hits its device limit or expires, the panel says so and offers the one button that fixes it
 - **Zashboard UI** at `http://192.168.1.1:9090/ui/` — nodes, active connections, logs, latency checks. Protected by an API secret
 - **Hourly subscription sync** — full config diffing with hot reload via the mihomo API (zero connection drops when changed). If the primary subscription address is unreachable, the router falls back to the mirror addresses dropweb sends in the subscription itself
@@ -103,6 +104,26 @@ ssh root@192.168.1.1 'curl -s 127.0.0.1:79/rci/show/ip/policy'
 ```
 
 The output should include a policy with `"description": "xkeen"`. The installer also checks and reports this at the end of setup.
+
+## Games and Calls (UDP)
+
+dropweb rules decide "VPN or direct" mostly by domain. UDP usually carries no domain: games, voice and video calls send packets straight to an IP. If all UDP goes into mihomo, games still end up direct by the rules, but with extra latency on the router: a PS5 went from 80–100 ms ping to 150–200.
+
+So the router reads the subscription config itself and sends into mihomo only the UDP that the rules can route to the VPN:
+
+- QUIC — UDP to the ports where mihomo sniffs the domain (currently 443), so YouTube and Instagram over QUIC follow the rules just like over TCP;
+- addresses from IP rules that lead to the VPN: Telegram, WhatsApp, Discord, Google Meet and whatever dropweb adds to the subscription;
+- mihomo's fake-ip range.
+
+All other UDP — games, PSN, Steam — bypasses mihomo through plain NAT. TCP is unaffected. The list is rebuilt on every subscription update. XKeen wipes its iptables chain on restart, so a `netfilter.d` hook puts the rule back, and the watchdog checks every minute that it is in place.
+
+If the subscription rules cannot be reduced to such a list (for example, the final `MATCH` rule leads to the VPN), the bypass turns itself off and all UDP goes through mihomo as before. The install summary says which mode was chosen and why. Same information:
+
+```sh
+ssh root@192.168.1.1 /opt/sbin/dropweb-udp-bypass.sh status
+```
+
+To send all UDP through mihomo: `UDP_BYPASS=0` in `/opt/etc/dropweb-xkeen/settings.env`, then `/opt/sbin/dropweb-udp-bypass.sh apply`.
 
 ## Post-Install Endpoints
 
@@ -220,6 +241,9 @@ The router's HWID is printed in the error message and stored in `/opt/etc/dropwe
 | `/opt/sbin/mihomo-resume.sh` | Re-enable VPN script |
 | `/opt/sbin/dropweb-xkeen-update.sh` | dropweb-xkeen self-update from GitHub (nightly cron, panel button) |
 | `/opt/backups/dropweb-xkeen/snapshot` | Pre-update snapshot for rollback |
+| `/opt/sbin/dropweb-udp-bypass.sh` | UDP bypass: builds the VPN-bound address list from the subscription and adds a rule to the XKeen chain |
+| `/opt/etc/dropweb-xkeen/udp-bypass/` | Built lists and the build result (`state.env`) |
+| `/opt/etc/ndm/netfilter.d/zz-dropweb-udp.sh` | Restores the bypass rule after XKeen rebuilds iptables |
 | `/opt/share/dropweb-xkeen/panel/` | Web panel: `mihomo-panel.py` (Python stdlib) and `index.html` |
 | `/opt/etc/init.d/S96mihomo-panel` | Web panel init script |
 | `/opt/sbin/mihomo-vpn-uninstall.sh` | Uninstaller |
@@ -253,6 +277,7 @@ ssh root@192.168.1.1 xkeen -remove
 - **XKeen 2.0.1 Beta only when required.** Non-interactive installation (`xkeen -i auto`) requires 2.0.1 Beta; stable is tried first and Beta is used only as a fallback.
 - **Fail-open by design (XKeen killswitch off).** If mihomo crashes, LAN devices fall back to direct internet access for up to a minute until the cron watchdog restarts mihomo, rather than bricking household connectivity.
 - **`geoipset` disabled** — all split-tunneling decisions happen inside mihomo using the subscription's rule providers rather than static iptables IP sets.
+- **The UDP bypass is derived from the rules, not configured by hand.** The only IP list in iptables is the one the router derives from the subscription config: dropweb changes rules in its template, routers pick them up with the next subscription update. The list errs on the side of inclusion (an extra address just means a packet goes through mihomo as before), and anything that cannot be parsed turns the bypass off entirely instead of letting traffic skip the rules.
 
 ## License
 
