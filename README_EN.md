@@ -216,7 +216,7 @@ Everything except Keenetic itself lives on the USB drive. If it is ejected, traf
 
 If the subscription returns a stub instead of proxy nodes, the **device limit** has been reached or the HWID was rejected:
 
-1. The installer prints the link where you can free a slot (`https://cab.dropweb.site/devices…`); the same list is in the dropweb bot → **Devices**. Remove an unused device
+1. The installer prints the link where you can free a slot (the **Devices** page of your account); the same list is in the dropweb bot → **Devices**. Remove an unused device
 2. Re-run the installer: `sh /tmp/install.sh -y`. If the router is already set up, just press "Free a slot" in the web panel and then "Update subscription"
 
 The router's HWID is printed in the error message and stored in `/opt/etc/dropweb-xkeen/settings.env`. Avoid changing it unnecessarily, as a new HWID consumes another device slot.
