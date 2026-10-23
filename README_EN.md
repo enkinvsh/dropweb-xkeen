@@ -21,7 +21,7 @@ A single script turns a Keenetic router with Entware into a **transparent VPN ro
 1. **Keenetic router** running KeeneticOS 4+ with Entware support (Giga, Ultra, Hopper, Sprinter, Peak, etc.)
 2. **Entware on a USB drive** — see [Entware from scratch](#entware-from-scratch)
 3. **Root SSH access** to Entware (default: `root@192.168.1.1`, password `keenetic` — change it right after setup)
-4. **Subscription URL from the dropweb bot** (`https://dropweb.site/s/…`). If the installer says the subscription could not be downloaded, get a fresh link from the bot
+4. **Subscription URL from the dropweb bot** — copy it from the bot as is, the address changes over time. If the installer says the subscription could not be downloaded, get a fresh link from the bot
 
 ### Entware from scratch
 
