@@ -168,6 +168,10 @@ button,a{-webkit-tap-highlight-color:transparent}
 /* Поле ссылки в духе CabinetCopyField: только чтение. */
 .field{padding:10px 16px;border-radius:26px;border:1px solid rgb(var(--white) / .04);background:rgb(var(--white) / .03);
   font-size:13px;line-height:20px;color:rgb(var(--color-dark-400));overflow-wrap:anywhere;word-break:break-all;width:100%}
+/* Список сайтов, которые роутер сам перевёл на VPN: имя бывает длиннее экрана. */
+.learn-list{display:flex;flex-direction:column;gap:8px;margin:0;padding:0;list-style:none}
+.learn-item{align-items:center;padding:8px 8px 8px 16px}
+.learn-host{font-size:13px;line-height:20px;color:rgb(var(--color-dark-100));overflow-wrap:anywhere;word-break:break-all}
 
 /* Кнопки (Button.variants): все размеры 26px, нажатие откликается сразу. */
 .btn{position:relative;display:inline-flex;align-items:center;justify-content:center;gap:8px;width:100%;height:48px;padding:0 24px;
@@ -195,6 +199,8 @@ button,a{-webkit-tap-highlight-color:transparent}
 .is-loading .spinner{display:block}
 @keyframes spin{to{transform:rotate(360deg)}}
 .btn .lbl{min-width:0;overflow-wrap:anywhere}
+/* Кнопка в строке списка: по ширине текста, но высота не меньше 44px — палец попадает. */
+.btn-sm{flex:none;width:auto;height:44px;padding:0 16px;font-size:14px;line-height:20px}
 
 /* CabinetNotice */
 .notice{padding:16px;border-radius:26px;border:1px solid;font-size:14px;line-height:22.75px}
@@ -372,6 +378,7 @@ button,a{-webkit-tap-highlight-color:transparent}
     <div class="rows">
       <button type="button" class="row" id="row-link"><svg class="ico" aria-hidden="true"><use href="#i-link"/></svg><span class="row-body"><span class="row-title">Сменить ссылку на подписку</span><span class="row-desc">Если купил новую подписку или старая ссылка не открывается</span></span><svg class="ico chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
       <button type="button" class="row" id="row-upg"><svg class="ico" aria-hidden="true"><use href="#i-dl"/></svg><span class="row-body"><span class="row-title">Обновление</span><span class="row-desc" id="x-upg">Узнаю версию…</span></span><span class="dot success" id="d-upg" role="img" aria-label="Вышла новая версия" hidden></span><svg class="ico chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
+      <button type="button" class="row" id="row-learn" hidden><svg class="ico" aria-hidden="true"><use href="#i-shield"/></svg><span class="row-body"><span class="row-title">Сайты через VPN</span><span class="row-desc" id="x-learn">…</span></span><svg class="ico chev" aria-hidden="true"><use href="#i-chev"/></svg></button>
       <a class="row" id="row-cab" target="_blank" rel="noopener" hidden><svg class="ico" aria-hidden="true"><use href="#i-user"/></svg><span class="row-body"><span class="row-title">Личный кабинет dropweb</span><span class="row-desc">Оплата и устройства</span></span><svg class="ico chev" aria-hidden="true"><use href="#i-ext"/></svg></a>
     </div>
   </section>
@@ -420,6 +427,30 @@ button,a{-webkit-tap-highlight-color:transparent}
           <span class="switch-text"><span class="switch-label" id="sw-al">Обновляться самому</span><span class="switch-desc" id="sw-ad">Ночью, когда интернетом почти не пользуются. Пока ставится новая версия, VPN может пропасть на минуту.</span></span>
           <button type="button" id="sw-auto" class="switch" role="switch" aria-checked="true" aria-labelledby="sw-al" aria-describedby="sw-ad" disabled><span class="switch-thumb"></span></button>
         </label>
+      </div>
+    </div>
+  </section>
+</div>
+
+<div class="sheet-root" id="sh-learn">
+  <div class="sheet-backdrop" data-close></div>
+  <section class="sheet" role="dialog" aria-modal="true" aria-labelledby="t-learn" tabindex="-1">
+    <div class="sheet-handle"><i></i></div>
+    <button type="button" class="sheet-close" data-close aria-label="Закрыть"><svg class="ico" aria-hidden="true"><use href="#i-x"/></svg></button>
+    <h2 class="sheet-title" id="t-learn">Сайты через VPN</h2>
+    <div class="sheet-body">
+      <div class="stack">
+        <p class="sheet-text">Провайдер иногда не блокирует сайт целиком, а обрывает загрузку посередине: игра пишет «Ожидание подключения к сети», страница грузится наполовину. Роутер замечает такие обрывы, проверяет сайт напрямую и через VPN и, если через VPN всё работает, дальше ведёт его через VPN.</p>
+        <div id="l-note" class="notice neutral compact" role="status" hidden></div>
+        <label class="switch-row" for="sw-learn">
+          <span class="switch-text"><span class="switch-label" id="sw-ll">Находить самому</span><span class="switch-desc" id="sw-ld">Первый обрыв ещё случится, но через пару минут сайт уже пойдёт через VPN.</span></span>
+          <button type="button" id="sw-learn" class="switch" role="switch" aria-checked="true" aria-labelledby="sw-ll" aria-describedby="sw-ld" disabled><span class="switch-thumb"></span></button>
+        </label>
+        <div>
+          <div class="label" id="l-head">Найденные сайты</div>
+          <ul class="learn-list" id="l-list" aria-labelledby="l-head"></ul>
+          <p class="hint" id="l-hint"></p>
+        </div>
       </div>
     </div>
   </section>
@@ -564,8 +595,9 @@ function renderOffline(){
   setHidden($('card-sub'),true);
   if(!busy)setHidden($('out'),true);
   setText($('vpn-hint'),'Состояние VPN неизвестно, пока нет связи с роутером.');
-  const sw=$('sw-vpn');sw.disabled=true;$('sw-auto').disabled=true;
+  const sw=$('sw-vpn');sw.disabled=true;$('sw-auto').disabled=true;$('sw-learn').disabled=true;
   for(const id of ['btn-chk','btn-upd','btn-link','btn-upg','btn-confirm','al-vpn'])$(id).disabled=true;
+  for(const b of $('l-list').querySelectorAll('button'))b.disabled=true;
   setHidden($('row-cab'),true);
 }
 function render(j){
@@ -580,7 +612,7 @@ function render(j){
   $('btn-chk').disabled=busy;
   for(const id of ['btn-upd','btn-link','btn-upg','btn-confirm','al-vpn'])$(id).disabled=lk;
   $('sw-auto').disabled=lk||autoBusy||!j.upd;
-  renderUpd(j.upd||{},now);upgToast(j);
+  renderUpd(j.upd||{},now);upgToast(j);renderLearn(j.learn,lk);
   setText($('cur-link'),u.link||'—');
   setHidden($('row-cab'),!u.cabinet_url);if(u.cabinet_url&&$('row-cab').getAttribute('href')!==u.cabinet_url)$('row-cab').href=u.cabinet_url;
   /* Подписка */
@@ -758,6 +790,73 @@ async function setAuto(){
   catch(e){toast(NOCONN,'error')}
   finally{autoBusy=false;apply();refresh()}
 }
+/* Сайты, которые провайдер обрывает напрямую: dropweb-learn.py находит их сам, здесь список и выключатель. */
+const LMSG={bad_host:'Неверное имя сайта',no_learn:'Поиск сайтов не установлен. Обнови dropweb-xkeen',busy:MSG.busy};
+let learnBusy=false,armHost=null,armT=0,learnSig='';
+function renderLearn(l,lk){
+  setHidden($('row-learn'),!l||!l.installed);
+  if(!l||!l.installed)return;
+  const n=l.count||0,cnt=n+' '+plural(n,'сайт','сайта','сайтов');
+  setText($('x-learn'),!l.on?'Выключено':!l.enabled?(n?cnt+' в списке, новые не ищу':'Поиск выключен'):(n?'Нашёл '+cnt:'Пока ничего не нашёл'));
+  let tone='',text='';
+  if(!l.on){tone='warning';text='Сейчас выключено: '+(l.reason||'причина неизвестна')+'.'}
+  else if(!l.enabled){tone='neutral';text='Новые сайты не ищу. Те, что уже в списке, идут через VPN.'}
+  const note=$('l-note');setHidden(note,!tone);
+  if(tone){setCls(note,'notice '+tone+' compact');setText(note,text)}
+  const sw=$('sw-learn');setAttr(sw,'aria-checked',String(l.enabled!==false));sw.disabled=lk||learnBusy||!l.on;
+  const items=l.items||[],ul=$('l-list');
+  /* Список пересобираем, только когда он поменялся: опрос раз в 5 секунд не должен сбивать нажатие. */
+  const sig=items.map(x=>x.host+'|'+x.at).join(',');
+  if(sig!==learnSig){
+    learnSig=sig;armHost=null;clearTimeout(armT);ul.textContent='';
+    for(const x of items){
+      const li=document.createElement('li');li.className='drow learn-item';
+      const body=document.createElement('div');body.className='drow-l';
+      const h=document.createElement('div');h.className='mono learn-host';h.textContent=x.host;
+      const d=document.createElement('div');d.className='drow-desc';d.textContent=(x.at?dTime(x.at):'')+(x.why?' · '+x.why:'');
+      body.append(h,d);
+      const b=document.createElement('button');b.type='button';b.className='btn btn-secondary btn-sm';b.dataset.host=x.host;
+      b.innerHTML='<span class="spinner" aria-hidden="true"></span><span class="lbl"></span>';
+      armBtn(b,false);li.append(body,b);ul.appendChild(li);
+    }
+  }
+  for(const b of ul.querySelectorAll('button'))b.disabled=lk;
+  setText($('l-hint'),!items.length?'Пока пусто. Если роутер найдёт такой сайт, он появится здесь.':
+    (n>items.length?'Показаны последние '+items.length+' из '+n+'. ':'')+'Убранный сайт роутер сам больше не добавит.');
+}
+function armBtn(b,on){
+  b.classList.toggle('btn-secondary',!on);b.classList.toggle('btn-danger',on);setText(b.querySelector('.lbl'),on?'Точно убрать':'Убрать');
+  b.setAttribute('aria-label',(on?'Точно убрать ':'Убрать ')+b.dataset.host);
+}
+/* Убрать — в два нажатия: первое только спрашивает, через 4 секунды вопрос снимается сам. */
+async function learnRemove(b){
+  const h=b.dataset.host;if(!h||busy||(last&&last.busy))return;
+  if(armHost!==h){
+    const old=armHost&&[...$('l-list').querySelectorAll('button')].find(x=>x.dataset.host===armHost);
+    if(old)armBtn(old,false);
+    armHost=h;armBtn(b,true);clearTimeout(armT);
+    armT=setTimeout(()=>{armHost=null;armBtn(b,false)},4000);
+    return;
+  }
+  clearTimeout(armT);armHost=null;hold(true,b,'Убираю…');
+  try{const j=await post('/learn-remove',{host:h});
+   if(j.learn&&last)last.learn=j.learn;
+   toast(j.ok?'Убрал '+h+', теперь он идёт напрямую':(LMSG[j.result]||MSG.error),j.ok?'success':j.result==='busy'?'warning':'error')}
+  catch(e){toast(NOCONN,'error')}
+  finally{hold(false,b);if(b.isConnected)armBtn(b,false);refresh()}
+}
+async function setLearn(){
+  const l=last&&last.learn;if(!l||busy||learnBusy)return;
+  const on=l.enabled===false;learnBusy=true;$('sw-learn').disabled=true;
+  try{const j=await post('/learn-auto',{on});
+   if(j.ok){if(last)last.learn=j.learn||Object.assign(l,{enabled:on});toast(on?'Роутер снова сам ищет такие сайты':'Новые сайты роутер больше не ищет, найденные идут через VPN','success')}
+   else toast(j.result==='busy'?MSG.busy:MSG.error,'warning')}
+  catch(e){toast(NOCONN,'error')}
+  finally{learnBusy=false;apply();refresh()}
+}
+$('l-list').addEventListener('click',e=>{const b=e.target.closest('button[data-host]');if(b&&!b.disabled)learnRemove(b)});
+$('sw-learn').onclick=setLearn;
+$('row-learn').onclick=e=>openSheet('sh-learn',e.currentTarget);
 $('sw-vpn').onclick=askSwitch;
 $('al-vpn').onclick=askSwitch;
 $('btn-confirm').onclick=action;

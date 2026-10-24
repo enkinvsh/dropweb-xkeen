@@ -1,7 +1,8 @@
 #!/opt/bin/python3
 # dropweb-xkeen: веб-панель роутера (python3 stdlib). Всё, что раньше требовало
 # SSH: вкл/выкл VPN, срок подписки и лимит устройств, обновление подписки сейчас,
-# смена ссылки, проверка связи, обновление всего dropweb-xkeen с GitHub.
+# смена ссылки, проверка связи, обновление всего dropweb-xkeen с GitHub, список
+# сайтов, которые роутер сам перевёл на VPN.
 # Внешний вид — index.html рядом с этим файлом, читается с диска на каждый запрос.
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import base64, datetime, json, os, re, shlex, subprocess, sys, threading, time
@@ -26,6 +27,13 @@ UPD_STATE = "/opt/etc/dropweb-xkeen/update-state.env"
 UPD_LOCK_PID = "/tmp/dxk-update.lock/pid"
 # Проверка обновлений = GitHub API + скачать install.sh (до ~2 минут при плохой связи).
 UPD_CHECK_TIMEOUT = 150
+# Сайты, которые провайдер режет напрямую: их находит dropweb-learn.py (cron раз в минуту).
+LEARN_PY = "/opt/sbin/dropweb-learn.py"
+LEARN_STATE = "/opt/etc/dropweb-xkeen/learn.json"
+LEARN_ENV = "/opt/etc/dropweb-xkeen/learn.env"
+# /status опрашивается каждые 5 секунд: весь список (до 500 сайтов) туда не кладём.
+LEARN_SHOW = 100
+HOST_RE = re.compile(r"(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}")
 PANIC = "/opt/sbin/mihomo-panic.sh"
 START = "/opt/sbin/mihomo-resume.sh"
 UPDATER = "/opt/sbin/update-mihomo-sub.sh"
@@ -386,6 +394,53 @@ def set_auto(on):
     log(f"автообновление {'включено' if on else 'выключено'} через панель")
     return {"ok": True, "auto": on}
 
+def learn_info():
+    env = read_env(LEARN_ENV)
+    try:
+        with open(LEARN_STATE, encoding="utf-8") as f:
+            hosts = json.load(f).get("hosts") or {}
+    except (OSError, ValueError, AttributeError):
+        hosts = {}
+    if not isinstance(hosts, dict):
+        hosts = {}
+    items = []
+    for h, v in hosts.items():
+        v = v if isinstance(v, dict) else {}
+        try:
+            at = int(v.get("at") or 0)
+        except (TypeError, ValueError):
+            at = 0
+        items.append({"host": h, "at": at, "why": str(v.get("why") or "")})
+    items.sort(key=lambda x: -x["at"])
+    return {"installed": os.path.exists(LEARN_PY),
+            "enabled": read_env(SETTINGS).get("DPI_LEARN", "1") != "0",
+            "on": env.get("LEARN_ON") == "1", "reason": env.get("LEARN_REASON", ""),
+            "group": env.get("LEARN_GROUP", ""), "count": len(items), "items": items[:LEARN_SHOW]}
+
+def learn_remove(host):
+    if not isinstance(host, str) or not HOST_RE.fullmatch(host.strip().lower()):
+        return {"ok": False, "result": "bad_host"}
+    if not os.path.exists(LEARN_PY):
+        return {"ok": False, "result": "no_learn"}
+    try:
+        r = subprocess.run([sys.executable, LEARN_PY, "remove", host.strip().lower()],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"learn-remove: {e}")
+        return {"ok": False, "result": "error", "learn": learn_info()}
+    if r.returncode != 0:
+        log(f"learn-remove rc={r.returncode}: {(r.stdout + r.stderr).strip()[-300:]}")
+        return {"ok": False, "result": "error", "learn": learn_info()}
+    log(f"{host} убран из списка «через VPN» через панель")
+    return {"ok": True, "result": "removed", "learn": learn_info()}
+
+def set_learn(on):
+    if not isinstance(on, bool):
+        return {"ok": False, "result": "bad_request"}
+    write_setting("DPI_LEARN", "1" if on else "0")
+    log(f"поиск заблокированных сайтов {'включён' if on else 'выключен'} через панель")
+    return {"ok": True, "enabled": on, "learn": learn_info()}
+
 
 class H(BaseHTTPRequestHandler):
     def log_message(self,format,*a): log("HTTP "+(format%a))
@@ -413,11 +468,11 @@ class H(BaseHTTPRequestHandler):
             upd=update_info()
             return self._json(200, {"running":p is not None,"pid":p,"disabled":os.path.exists(DISABLED),
                                     "autostart":autostart(),"busy":BUSY.locked() or upd["locked"],
-                                    "sub":sub_info(),"upd":upd})
+                                    "sub":sub_info(),"upd":upd,"learn":learn_info()})
         return self._send(404,"not found","text/plain; charset=utf-8")
     def do_POST(self):
         path=self.path.split("?",1)[0]
-        if path not in ("/panic","/resume","/update","/check","/link","/upgrade","/upgrade-check","/auto-update"):
+        if path not in ("/panic","/resume","/update","/check","/link","/upgrade","/upgrade-check","/auto-update","/learn-remove","/learn-auto"):
             return self._send(404,"not found","text/plain; charset=utf-8")
         # Защита от чужих сайтов: свой заголовок требует CORS preflight, а OPTIONS мы не отвечаем.
         if self.headers.get("X-Dropweb-Panel") != "1":
@@ -437,6 +492,8 @@ class H(BaseHTTPRequestHandler):
             if path == "/upgrade": return self._json(200, start_upgrade())
             if path == "/upgrade-check": return self._json(200, check_upgrade())
             if path == "/auto-update": return self._json(200, set_auto(self._body().get("on")))
+            if path == "/learn-remove": return self._json(200, learn_remove(self._body().get("host")))
+            if path == "/learn-auto": return self._json(200, set_learn(self._body().get("on")))
             return self._json(200, change_link(self._body().get("url")))
         finally:
             BUSY.release()
