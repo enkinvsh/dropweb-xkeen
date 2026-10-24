@@ -14,8 +14,8 @@
 #       TPROXY :1181 (listeners), TUN выключен; ставит zashboard (с секретом)
 #    6. Ставит веб-панель (файлы panel/ из репозитория): VPN вкл/выкл, проверка
 #       связи, срок подписки, «Обновить сейчас», смена ссылки, подсказка с одной
-#       кнопкой, когда подписка упёрлась в лимит устройств или кончилась, и
-#       раздел «Обновление»
+#       кнопкой, когда подписка упёрлась в лимит устройств или кончилась,
+#       разделы «Обновление» и «Сайты через VPN»
 #    7. Ежечасно обновляет подписку (по содержимому, с горячей перезагрузкой;
 #       если основной адрес недоступен — через запасные из заголовков
 #       подписки) и ставит watchdog
@@ -26,6 +26,9 @@
 #    9. Пускает игры и прочий UDP мимо mihomo: в него идёт только UDP, который
 #       правила подписки могут отправить в VPN (QUIC, звонки Telegram,
 #       WhatsApp, Discord, Meet), остальной — обычным NAT (UDP_BYPASS=1)
+#   10. Сам находит сайты, которые провайдер режет на прямом пути (ТСПУ
+#       замораживает соединение после ~16 КБ): проверяет их напрямую и через
+#       VPN и, если помогает только VPN, добавляет в свой список (DPI_LEARN=1)
 #
 #  Использование (на роутере по SSH под root):
 #     curl -fsSL -o /tmp/install.sh https://raw.githubusercontent.com/enkinvsh/dropweb-xkeen/main/install.sh
@@ -41,7 +44,7 @@
 
 set -eu
 
-DROPWEB_XKEEN_VERSION="2.4.1"
+DROPWEB_XKEEN_VERSION="2.5.0"
 SCRIPT_VERSION=$DROPWEB_XKEEN_VERSION
 
 # XKeen иначе уходит в фон и сразу возвращает 0 — нам нужен честный код возврата.
@@ -63,6 +66,7 @@ SELF_UPDATER=/opt/sbin/dropweb-xkeen-update.sh
 UDP_BYPASS_SH=/opt/sbin/dropweb-udp-bypass.sh
 # «zz-»: ndm запускает хуки по алфавиту, наш должен идти после proxy.sh XKeen.
 UDP_HOOK=/opt/etc/ndm/netfilter.d/zz-dropweb-udp.sh
+LEARN_PY=/opt/sbin/dropweb-learn.py
 XKEEN_INIT=/opt/etc/init.d/S05xkeen
 CONF=/opt/etc/mihomo/config.yaml
 PRECHECK_FILE=/tmp/dropweb-sub-check.$$
@@ -138,6 +142,10 @@ dropweb-xkeen — VPN dropweb на Keenetic через XKeen 2 + mihomo
   AUTO_UPDATE     1 — обновляться самому ночью (по умолчанию), 0 — только кнопкой
   UDP_BYPASS      1 — UDP, который подписка не шлёт в VPN (игры), мимо mihomo
                   (по умолчанию), 0 — весь UDP через mihomo, как до 2.4.0
+  DPI_LEARN       1 — самому находить сайты, которые провайдер режет напрямую,
+                  и пускать их через VPN (по умолчанию), 0 — не искать новые
+  DPI_LEARN_GROUP группа mihomo для найденных сайтов (по умолчанию — та,
+                  куда подписка шлёт больше всего правил, обычно «🌍 VPN»)
   ASSUME_YES=1    то же, что -y
 
 Пример:
@@ -185,10 +193,13 @@ ENV_LAN_IP=${LAN_IP:-}
 ENV_UPDATE_URL=${UPDATE_URL:-}
 ENV_AUTO_UPDATE=${AUTO_UPDATE:-}
 ENV_UDP_BYPASS=${UDP_BYPASS:-}
+ENV_DPI_LEARN=${DPI_LEARN:-}
+ENV_DPI_LEARN_GROUP=${DPI_LEARN_GROUP:-}
 
 SUB_URL=""; HWID=""; DEVICE_OS=""; OS_VERSION=""; DEVICE_MODEL=""
 USER_AGENT_HDR=""; PANEL_PORT=""; API_PORT=""; API_SECRET=""; LAN_IP=""
 UPDATE_URL=""; AUTO_UPDATE=""; PANEL_SOURCE=""; UDP_BYPASS=""
+DPI_LEARN=""; DPI_LEARN_GROUP=""
 
 SETTINGS_ORIGIN="новая установка"
 if [ -f "$SETTINGS_FILE" ]; then
@@ -234,6 +245,8 @@ DROPWEB_XKEEN_VERSION=$SCRIPT_VERSION
 [ -z "$ENV_UPDATE_URL" ]     || UPDATE_URL=$ENV_UPDATE_URL
 [ -z "$ENV_AUTO_UPDATE" ]    || AUTO_UPDATE=$ENV_AUTO_UPDATE
 [ -z "$ENV_UDP_BYPASS" ]     || UDP_BYPASS=$ENV_UDP_BYPASS
+[ -z "$ENV_DPI_LEARN" ]      || DPI_LEARN=$ENV_DPI_LEARN
+[ -z "$ENV_DPI_LEARN_GROUP" ] || DPI_LEARN_GROUP=$ENV_DPI_LEARN_GROUP
 # 2.1.x хранила только адрес панели (PANEL_SOURCE=<ветка>/panel): адрес ветки — на уровень выше.
 if [ -z "$UPDATE_URL" ]; then
   case "$PANEL_SOURCE" in http://?*/panel|https://?*/panel) UPDATE_URL=${PANEL_SOURCE%/panel} ;; esac
@@ -305,6 +318,7 @@ fi
 UPDATE_URL=${UPDATE_URL%/}
 [ "$AUTO_UPDATE" = 0 ]   || AUTO_UPDATE=1
 [ "$UDP_BYPASS" = 0 ]    || UDP_BYPASS=1
+[ "$DPI_LEARN" = 0 ]     || DPI_LEARN=1
 
 case "$PANEL_PORT" in ''|*[!0-9]*) die "PANEL_PORT должен быть числом (сейчас: $PANEL_PORT)" ;; esac
 case "$UPDATE_URL" in http://?*|https://?*) ;; *) die "UPDATE_URL должен быть адресом http(s):// (сейчас: $UPDATE_URL)" ;; esac
@@ -366,6 +380,11 @@ if [ "$UDP_BYPASS" = 1 ]; then
 else
   say "  UDP          : весь через mihomo (UDP_BYPASS=0)"
 fi
+if [ "$DPI_LEARN" = 1 ]; then
+  say "  блокировки   : сайты, которые режет провайдер, находит сам${DPI_LEARN_GROUP:+ (группа $DPI_LEARN_GROUP)}"
+else
+  say "  блокировки   : новые не ищет, найденные идут через VPN (DPI_LEARN=0)"
+fi
 say "  (любой параметр можно задать переменной окружения, см. sh install.sh -h)"
 say ""
 
@@ -398,6 +417,8 @@ save_settings() {
       printf 'UPDATE_URL=%s\n' "$(shq "$UPDATE_URL")"
       printf 'AUTO_UPDATE=%s\n' "$(shq "$AUTO_UPDATE")"
       printf 'UDP_BYPASS=%s\n' "$(shq "$UDP_BYPASS")"
+      printf 'DPI_LEARN=%s\n' "$(shq "$DPI_LEARN")"
+      printf 'DPI_LEARN_GROUP=%s\n' "$(shq "$DPI_LEARN_GROUP")"
     } >"$ss_tmp"
   )
   chmod 600 "$ss_tmp"
@@ -658,7 +679,7 @@ if ! mkdir "$LOCK" 2>/dev/null; then
   rm -rf "$LOCK"; mkdir "$LOCK" 2>/dev/null || exit 5
 fi
 echo $$ >"$LOCK/pid"
-trap 'rm -rf "$LOCK" "$RAW" "$TMP" "$HDR"' EXIT
+trap 'rm -rf "$LOCK" "$RAW" "$TMP" "$TMP.base" "$HDR"' EXIT
 trap 'exit 1' INT TERM
 
 # 1. Скачать: своя ссылка, затем зеркала из прошлого ответа сервиса.
@@ -760,11 +781,27 @@ if ! { cp "$RAW" "$TMP" && yq -i "$EXPR" "$TMP"; } >>"$LOG" 2>&1; then
   finish not_config 2
 fi
 
+# 5б. Сайты, которые провайдер режет напрямую (dropweb-learn.py): их список
+# правилом перед MATCH и вход dxk-probe, через который их проверяют по VPN.
+LEARN_ADDED=0
+if [ -x /opt/sbin/dropweb-learn.py ]; then
+  cp "$TMP" "$TMP.base"
+  /opt/sbin/dropweb-learn.py prepare "$TMP" >>"$LOG" 2>&1
+  cmp -s "$TMP" "$TMP.base" || LEARN_ADDED=1
+fi
+
 # 6. Проверка mihomo
 if ! mihomo -t -d "$CONF_DIR" -f "$TMP" >>"$LOG" 2>&1; then
-  log "ERR: mihomo -t не принял конфиг; текущий не трогаю"
-  finish bad_config 3
+  # Наша вставка не должна стоить человеку подписки: без неё VPN как раньше.
+  if [ "$LEARN_ADDED" = 1 ] && mv "$TMP.base" "$TMP" && mihomo -t -d "$CONF_DIR" -f "$TMP" >>"$LOG" 2>&1; then
+    log "WARN: mihomo не принял список сайтов dropweb-learn — ставлю конфиг без него"
+    /opt/sbin/dropweb-learn.py off "mihomo не принял правило со списком" >>"$LOG" 2>&1
+  else
+    log "ERR: mihomo -t не принял конфиг; текущий не трогаю"
+    finish bad_config 3
+  fi
 fi
+rm -f "$TMP.base"
 
 # 7. Сравнение всего содержимого (не только имён нод)
 SUB_LAST_OK=$(date +%s)
@@ -1044,7 +1081,9 @@ SNAP_PATHS="/opt/sbin/update-mihomo-sub.sh /opt/sbin/mihomo-watchdog.sh /opt/sbi
 /opt/sbin/mihomo /opt/etc/init.d/S05xkeen /opt/etc/init.d/S96mihomo-panel /opt/share/dropweb-xkeen
 /opt/etc/dropweb-xkeen/settings.env /opt/etc/dropweb-xkeen/sub-state.env $CONF
 /opt/etc/mihomo/.disabled /opt/var/spool/cron/crontabs/root
-/opt/sbin/dropweb-udp-bypass.sh /opt/etc/ndm/netfilter.d/zz-dropweb-udp.sh"
+/opt/sbin/dropweb-udp-bypass.sh /opt/etc/ndm/netfilter.d/zz-dropweb-udp.sh
+/opt/sbin/dropweb-learn.py /opt/etc/dropweb-xkeen/learn.json /opt/etc/dropweb-xkeen/learn.env
+/opt/etc/mihomo/dxk-learned.txt"
 
 mkdir -p /opt/var/log
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
@@ -1986,6 +2025,924 @@ exec /opt/sbin/dropweb-udp-bypass.sh apply >/dev/null 2>&1
 EOF_UDPHOOK
 }
 
+write_learn() {
+cat >"$LEARN_PY" <<'EOF_LEARN'
+#!/opt/bin/python3
+# dropweb-xkeen: находит сайты, которые провайдер «замораживает» напрямую, и ведёт их через VPN.
+#
+# С 2025 года ТСПУ у части провайдеров обрывает TCP к зарубежным хостингам и CDN
+# (Akamai, CloudFront, Cloudflare, Hetzner…) примерно после 16 КБ: сервер просто
+# перестаёт отвечать, без RST. Готовых списков таких сайтов нет: их слишком много,
+# и у каждого провайдера свои. 2026-10-24 так висела игра на PS5 («Ожидание
+# подключения к сети»): ak-api.neople.co.kr напрямую отдавал 9 ответов и замолкал,
+# через VPN работал.
+#
+#   scan              cron раз в минуту, ~50 с: ищет замолчавшие соединения mihomo
+#                     к сайтам, которые подписка ведёт напрямую (MATCH), проверяет
+#                     сайт напрямую и через VPN; застрял напрямую дважды, а через VPN
+#                     прошёл — сайт уходит в dxk-learned.txt, mihomo подхватывает
+#                     список без перезапуска, зависшие соединения закрываются
+#   prepare <config>  из update-mihomo-sub.sh: список, правило перед MATCH и
+#                     служебный вход dxk-probe (проверки через VPN) в конфиг
+#   off <причина>     выключить (апдейтер, если mihomo не принял конфиг)
+#   probe <host> [ip] [port]   проверить сайт вручную, ничего не меняя
+#   list | status            список и состояние
+#   remove <host> | allow <host>   убрать сайт насовсем | снова разрешить добавлять
+#   recheck [host]           перепроверить выученный сайт напрямую
+import fcntl
+import ipaddress
+import json
+import os
+import re
+import shlex
+import socket
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from collections import Counter
+from contextlib import contextmanager
+
+SETTINGS = "/opt/etc/dropweb-xkeen/settings.env"
+STATE = "/opt/etc/dropweb-xkeen/learn.json"
+ENVF = "/opt/etc/dropweb-xkeen/learn.env"
+CONF = "/opt/etc/mihomo/config.yaml"
+LIST = "/opt/etc/mihomo/dxk-learned.txt"
+DISABLED = "/opt/etc/mihomo/.disabled"
+UPD_LOCK = "/tmp/dxk-update.lock"
+RUN = "/tmp/dxk-learn"
+LOG = "/opt/var/log/dropweb-learn.log"
+YQ = "/opt/sbin/yq" if os.path.exists("/opt/sbin/yq") else "yq"
+PROVIDER = "dxk-learned"
+LISTENER = "dxk-probe"
+FIRST_PORT = 7899
+
+SCAN_FOR = 50          # cron раз в минуту: scan успевает закончиться до следующего
+SAMPLE_EVERY = 5       # соединение короче интервала может не попасть в карту адресов
+HOST_MAP_TTL = 300     # адрес → сайт помним 5 минут: сокет может застрять уже после закрытия
+PER_RUN = 3            # сайтов за один scan
+PER_DAY = 150          # проверок в сутки: защита от бесконечных проверок на кривой сети
+MAX_HOSTS = 500
+COOLDOWN = {"ok": 12 * 3600, "flaky": 6 * 3600, "dead": 6 * 3600, "error": 3600}
+RECHECK_AFTER = 7 * 86400
+
+# Проверка: как браузер — много запросов в одном соединении, пока не придёт 40 КБ;
+# если ответы мелкие, ещё и отправка 64 КБ. Заморозка срабатывает на ~16 КБ в любую
+# сторону, а на 40 КБ здоровый сайт гарантированно её проходит.
+WANT_RX = 40 * 1024
+SMALL_RX = 24 * 1024
+POST_SIZE = 64 * 1024
+MAX_REQS = 40
+MAX_CONNS = 4
+CONNECT_TIMEOUT = 6
+READ_TIMEOUT = 5
+POST_TIMEOUT = 8
+TEST_BUDGET = 25
+HTTP_PORTS = {80, 8080, 8880}
+
+HOST_RE = re.compile(r"^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$")
+NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+# ---------------------------------------------------------------- мелочи
+
+def now():
+    return int(time.time())
+
+
+def log(msg):
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        if os.path.exists(LOG) and os.path.getsize(LOG) > 128 * 1024:
+            with open(LOG, encoding="utf-8", errors="replace") as f:
+                tail = f.readlines()[-300:]
+            with open(LOG, "w", encoding="utf-8") as f:
+                f.writelines(tail)
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write("[%s] %s\n" % (time.strftime("%F %T"), msg))
+    except OSError:
+        pass
+
+
+def read_env(path):
+    out = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                try:
+                    parts = shlex.split(v)
+                except ValueError:
+                    continue
+                out[k.strip()] = parts[0] if parts else ""
+    except OSError:
+        pass
+    return out
+
+
+def q(v):
+    return "'" + str(v).replace("'", "'\\''") + "'"
+
+
+def write_file(path, text, mode=0o600):
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    tmp = os.path.join(d, "." + os.path.basename(path) + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def valid_host(h):
+    h = str(h or "").strip().lower().rstrip(".")
+    if not HOST_RE.match(h):
+        return ""
+    try:
+        ipaddress.ip_address(h)
+        return ""
+    except ValueError:
+        return h
+
+
+def is_global(ip):
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if a.version == 6 and a.ipv4_mapped:
+        a = a.ipv4_mapped
+    return a.is_global
+
+
+def norm_ip(ip):
+    a = ipaddress.ip_address(ip)
+    if a.version == 6 and a.ipv4_mapped:
+        a = a.ipv4_mapped
+    return a.compressed
+
+
+# ---------------------------------------------------------------- состояние
+
+def empty_state():
+    return {"hosts": {}, "never": {}, "seen": {}, "day": "", "probes": 0}
+
+
+def load_state():
+    try:
+        with open(STATE, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        d = {}
+    if not isinstance(d, dict):
+        d = {}
+    base = empty_state()
+    for k, v in base.items():
+        if not isinstance(d.get(k), type(v)):
+            d[k] = v
+    return d
+
+
+def save_state(d):
+    write_file(STATE, json.dumps(d, ensure_ascii=False, sort_keys=True, indent=1) + "\n")
+
+
+@contextmanager
+def locked():
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    with open(STATE + ".lock", "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def write_list(hosts):
+    write_file(LIST, "".join(h + "\n" for h in sorted(hosts)), 0o644)
+
+
+def set_env(on, reason="", group="", port=""):
+    old = read_env(ENVF)
+    group = group or old.get("LEARN_GROUP", "")
+    port = port or old.get("LEARN_PORT", "")
+    write_file(ENVF, "".join(k + "=" + q(v) + "\n" for k, v in (
+        ("LEARN_ON", 1 if on else 0), ("LEARN_REASON", reason), ("LEARN_GROUP", group),
+        ("LEARN_PORT", port), ("LEARN_AT", now()))))
+
+
+# ---------------------------------------------------------------- запросы к mihomo
+
+def api(method, path, timeout=5):
+    s = read_env(SETTINGS)
+    req = urllib.request.Request("http://127.0.0.1:%s%s" % (s.get("API_PORT") or "9090", path), method=method)
+    if s.get("API_SECRET"):
+        req.add_header("Authorization", "Bearer " + s["API_SECRET"])
+    try:
+        with NO_PROXY.open(req, timeout=timeout) as r:
+            body = r.read()
+            return r.status, (json.loads(body) if body else None)
+    except urllib.error.HTTPError as e:
+        return e.code, None
+    except (OSError, ValueError):
+        return 0, None
+
+
+def reload_list():
+    code, _ = api("PUT", "/providers/rules/" + PROVIDER)
+    return code in (200, 204)
+
+
+def conn_host(c):
+    m = c.get("metadata") or {}
+    return valid_host(m.get("sniffHost") or m.get("host"))
+
+
+def direct_match(c):
+    """Соединение, которое mihomo ведёт напрямую по последнему правилу подписки."""
+    m = c.get("metadata") or {}
+    chains = c.get("chains") or []
+    return (m.get("network") == "tcp" and c.get("rule") == "Match"
+            and bool(chains) and chains[0] == "DIRECT")
+
+
+def close_direct(host):
+    code, d = api("GET", "/connections")
+    n = 0
+    for c in (d or {}).get("connections") or []:
+        if conn_host(c) == host and direct_match(c):
+            if api("DELETE", "/connections/" + str(c.get("id")))[0] in (200, 204):
+                n += 1
+    return n
+
+
+# ---------------------------------------------------------------- сокеты роутера
+
+def _hex_ip(h):
+    b = bytes.fromhex(h)
+    if len(b) == 4:
+        return str(ipaddress.IPv4Address(b[::-1]))
+    words = [b[i:i + 4][::-1] for i in range(0, 16, 4)]
+    return norm_ip(str(ipaddress.IPv6Address(b"".join(words))))
+
+
+def parse_proc(text):
+    """Строки /proc/net/tcp{,6} → (адрес, порт, состояние, очередь, таймер, повторы, keepalive)."""
+    out = []
+    for line in text.splitlines()[1:]:
+        f = line.split()
+        if len(f) < 10:
+            continue
+        try:
+            rip, rport = f[2].split(":")
+            out.append((_hex_ip(rip), int(rport, 16), int(f[3], 16), int(f[4].split(":")[0], 16),
+                        int(f[5].split(":")[0], 16), int(f[6], 16), int(f[8])))
+        except (ValueError, IndexError):
+            continue
+    return out
+
+
+def stuck(st, txq, timer, retr, probes):
+    """Почему сокет похож на замороженный поток, или None.
+
+    Здоровый сервер подтверждает данные и keepalive за время RTT. Заморозка ТСПУ
+    молча выбрасывает пакеты потока: данные висят неподтверждёнными с повторами
+    (таймер 1), а keepalive mihomo (раз в 15 с после 30 с тишины) остаётся без
+    ответа (таймер 2, probes_out). Таймер 4 — клиент не успевает читать, не наш случай.
+    """
+    if st in (1, 4, 8, 9, 11) and timer == 1 and txq > 0 and retr >= 3:
+        return "данные ушли, ответа нет"
+    if st == 1 and timer == 2 and probes >= 2:
+        return "сервер замолчал посреди ответа"
+    if st == 2 and retr >= 2:
+        return "не соединяется"
+    return None
+
+
+def stuck_sockets():
+    out = {}
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(path) as f:
+                rows = parse_proc(f.read())
+        except OSError:
+            continue
+        for ip, port, st, txq, timer, retr, probes in rows:
+            if not is_global(ip):
+                continue
+            why = stuck(st, txq, timer, retr, probes)
+            if why:
+                out.setdefault((ip, port), why)
+    return out
+
+
+# ---------------------------------------------------------------- проверка сайта
+
+class Stall(Exception):
+    pass
+
+
+class Closed(Exception):
+    pass
+
+
+def open_conn(host, ip, port, via):
+    if via:
+        s = socket.create_connection(("127.0.0.1", int(via)), timeout=CONNECT_TIMEOUT)
+        s.sendall(("CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n" % (host, port, host, port)).encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = s.recv(4096)
+            if not chunk:
+                s.close()
+                raise OSError("VPN-вход закрыл соединение")
+            head += chunk
+            if len(head) > 16384:
+                s.close()
+                raise OSError("VPN-вход ответил мусором")
+        if head.split(None, 2)[1:2] != [b"200"]:
+            s.close()
+            raise OSError("VPN-вход: " + head.split(b"\r\n", 1)[0].decode("latin-1")[:60])
+    else:
+        s = socket.create_connection((ip, port), timeout=CONNECT_TIMEOUT)
+    if port in HTTP_PORTS:
+        return s
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.set_alpn_protocols(["http/1.1"])
+    try:
+        return ctx.wrap_socket(s, server_hostname=host)
+    except (OSError, ssl.SSLError):
+        s.close()
+        raise
+
+
+class Reader:
+    def __init__(self, sock, timeout):
+        self.s, self.buf, self.rx = sock, b"", 0
+        sock.settimeout(timeout)
+
+    def fill(self):
+        try:
+            chunk = self.s.recv(16384)
+        except (socket.timeout, TimeoutError):
+            raise Stall()
+        except (ssl.SSLError, OSError):
+            raise Closed()
+        if not chunk:
+            raise Closed()
+        self.rx += len(chunk)
+        self.buf += chunk
+
+    def line(self, budget):
+        while b"\r\n" not in self.buf:
+            if self.rx >= budget:
+                return None
+            self.fill()
+        ln, self.buf = self.buf.split(b"\r\n", 1)
+        return ln
+
+    def chunked(self, budget):
+        """Дочитывает тело по кускам. → True, если ответ закончился (соединение годно)."""
+        while True:
+            ln = self.line(budget)
+            if ln is None:
+                return False
+            try:
+                size = int(ln.split(b";")[0].strip() or b"0", 16)
+            except ValueError:
+                return False
+            if size == 0:
+                while True:  # трейлеры до пустой строки
+                    ln = self.line(budget)
+                    if ln is None:
+                        return False
+                    if not ln:
+                        return True
+            while len(self.buf) < size + 2:
+                if self.rx >= budget:
+                    return False
+                self.fill()
+            self.buf = self.buf[size + 2:]
+
+    def response(self, budget):
+        """Читает один ответ. → сохранить ли соединение для следующего запроса."""
+        while b"\r\n\r\n" not in self.buf:
+            if len(self.buf) > 65536:
+                return False
+            self.fill()
+        head, self.buf = self.buf.split(b"\r\n\r\n", 1)
+        lines = head.decode("latin-1").split("\r\n")
+        hdr = {}
+        for ln in lines[1:]:
+            k, _, v = ln.partition(":")
+            hdr[k.strip().lower()] = v.strip().lower()
+        keep = lines[0].startswith("HTTP/1.1") and hdr.get("connection") != "close"
+        try:
+            length = int(hdr["content-length"])
+        except (KeyError, ValueError):
+            length = None
+        status = lines[0].split(" ", 2)[1:2]
+        if status and (status[0].startswith("1") or status[0] in ("204", "304")):
+            length = 0
+        if "chunked" in hdr.get("transfer-encoding", ""):
+            return self.chunked(budget) and keep
+        if length is None:
+            # Тело до закрытия соединения: читаем, пока хватает бюджета, дальше оно не нужно.
+            while self.rx < budget:
+                self.fill()
+            return False
+        while len(self.buf) < length:
+            if self.rx >= budget:
+                return False
+            self.fill()
+        self.buf = self.buf[length:]
+        return keep
+
+
+def run_test(host, ip, port, via=None):
+    """Одинаковый тест напрямую (via=None) и через VPN (via=порт dxk-probe).
+
+    → (ok, что видели). ok=False: застряло (stall), не открылось (connect) и т.п.
+    """
+    req = ("GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\n"
+           "Connection: keep-alive\r\n\r\n" % host).encode()
+    t_end = time.monotonic() + TEST_BUDGET
+    rx, reqs, conns = 0, 0, 0
+    while reqs < MAX_REQS and rx < WANT_RX and conns < MAX_CONNS and time.monotonic() < t_end:
+        try:
+            s = open_conn(host, ip, port, via)
+        except (OSError, ssl.SSLError) as e:
+            if conns:
+                break  # сайт закрывает соединения, но уже отвечал — судим по объёму
+            return False, "не открылось: %s" % (str(e) or type(e).__name__)[:80]
+        conns += 1
+        rd = Reader(s, READ_TIMEOUT)
+        try:
+            while reqs < MAX_REQS and rx + rd.rx < WANT_RX and time.monotonic() < t_end:
+                s.sendall(req)
+                reqs += 1
+                if not rd.response(WANT_RX - rx):
+                    break
+        except Stall:
+            return False, "застряло после %d Б и %d запросов" % (rx + rd.rx, reqs)
+        except (socket.timeout, TimeoutError):
+            return False, "запрос не уходит после %d Б и %d запросов" % (rx + rd.rx, reqs)
+        except (Closed, OSError):
+            pass  # сервер закрыл соединение между ответами — откроем новое
+        finally:
+            rx += rd.rx
+            s.close()
+    if rx >= SMALL_RX:
+        return True, "%d Б за %d запросов" % (rx, reqs)
+    if rx == 0:
+        return False, "нет ответа ни на один запрос"
+    # Ответы мелкие: порог заморозки не набран — проверяем отправкой.
+    try:
+        s = open_conn(host, ip, port, via)
+    except (OSError, ssl.SSLError) as e:
+        return False, "не открылось для отправки: %s" % (str(e) or type(e).__name__)[:80]
+    rd = Reader(s, POST_TIMEOUT)
+    s.settimeout(POST_TIMEOUT)
+    try:
+        s.sendall(("POST / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nContent-Type: "
+                   "application/octet-stream\r\nContent-Length: %d\r\nConnection: close\r\n\r\n"
+                   % (host, POST_SIZE)).encode() + b"\0" * POST_SIZE)
+        rd.response(4096)
+    except (Stall, socket.timeout, TimeoutError):
+        return False, "%d Б за %d запросов, отправка 64 КБ застряла" % (rx, reqs)
+    except (Closed, OSError):
+        pass  # сервер ответил или закрыл соединение — значит, данные до него доходят
+    finally:
+        s.close()
+    return True, "%d Б за %d запросов, отправка 64 КБ прошла" % (rx, reqs)
+
+
+def resolve(host, port):
+    try:
+        infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+        return infos[0][4][0] if infos else ""
+    except OSError:
+        return ""
+
+
+def judge(host, ip, port, via):
+    """→ (итог, подробности): learn | ok | flaky | dead."""
+    ok, d1 = run_test(host, ip, port)
+    if ok:
+        return "ok", "напрямую: " + d1
+    if not via:
+        return "dead", "напрямую: %s; через VPN проверить нечем" % d1
+    vok, dv = run_test(host, ip, port, via)
+    if not vok:
+        return "dead", "напрямую: %s; через VPN: %s" % (d1, dv)
+    ok2, d2 = run_test(host, ip, port)
+    if ok2:
+        return "flaky", "напрямую то застревает, то нет (%s; потом %s)" % (d1, d2)
+    return "learn", "напрямую: %s; через VPN: %s" % (d1, dv)
+
+
+# ---------------------------------------------------------------- scan
+
+def live_port():
+    env = read_env(ENVF)
+    if env.get("LEARN_ON") != "1":
+        return None, "выключено: " + (env.get("LEARN_REASON") or "конфиг ещё не подготовлен")
+    port = env.get("LEARN_PORT", "")
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=2):
+            return int(port), ""
+    except (OSError, ValueError):
+        return None, "вход %s для проверок через VPN не слушает" % (port or "?")
+
+
+def gate():
+    """Причина не учиться сейчас или пустая строка."""
+    if read_env(SETTINGS).get("DPI_LEARN", "1") == "0":
+        return "DPI_LEARN=0"
+    if os.path.exists(DISABLED):
+        return "VPN выключен"
+    if os.path.isdir(UPD_LOCK):
+        return "идёт обновление"
+    return ""
+
+
+def load_map():
+    try:
+        with open(os.path.join(RUN, "hosts.json"), encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_map(m):
+    t = now()
+    m = {k: {h: ts for h, ts in v.items() if t - ts < HOST_MAP_TTL} for k, v in m.items()}
+    write_file(os.path.join(RUN, "hosts.json"), json.dumps({k: v for k, v in m.items() if v}))
+
+
+def remember(m, conns):
+    t = now()
+    for c in conns:
+        if not direct_match(c):
+            continue
+        meta = c.get("metadata") or {}
+        h, ip = conn_host(c), meta.get("destinationIP") or ""
+        if not h or not is_global(ip):
+            continue
+        try:
+            key = "%s|%d" % (norm_ip(ip), int(meta.get("destinationPort") or 0))
+        except ValueError:
+            continue
+        m.setdefault(key, {})[h] = t
+
+
+def candidates(m, stuck_map, st):
+    t = now()
+    out = []
+    for (ip, port), why in stuck_map.items():
+        for h, ts in sorted((m.get("%s|%d" % (ip, port)) or {}).items(), key=lambda x: -x[1]):
+            if t - ts >= HOST_MAP_TTL or h in st["hosts"] or h in st["never"]:
+                continue
+            seen = st["seen"].get(h)
+            if isinstance(seen, dict) and seen.get("until", 0) > t:
+                continue
+            if all(c[0] != h for c in out):
+                out.append((h, ip, port, why))
+    return out
+
+
+def budget_left(st):
+    day = time.strftime("%F")
+    if st.get("day") != day:
+        st["day"], st["probes"] = day, 0
+    return PER_DAY - int(st.get("probes") or 0)
+
+
+def check_host(h, ip, port, why, via):
+    with locked():
+        st = load_state()
+        if budget_left(st) <= 0:
+            return None
+        st["probes"] += 1
+        save_state(st)
+    log("подозрение: %s (%s:%d) — %s, проверяю" % (h, ip, port, why))
+    res, detail = judge(h, ip, port, via)
+    t = now()
+    with locked():
+        st = load_state()
+        if res == "learn":
+            if h not in st["never"] and len(st["hosts"]) < MAX_HOSTS:
+                st["hosts"][h] = {"at": t, "ip": ip, "port": port, "why": why, "checked": t, "ok": 0}
+                st["seen"].pop(h, None)
+                save_state(st)
+                write_list(st["hosts"])
+            else:
+                res = "skip"
+        else:
+            st["seen"][h] = {"res": res, "until": t + COOLDOWN.get(res, 3600)}
+            save_state(st)
+    if res == "learn":
+        reloaded = reload_list()
+        closed = close_direct(h)
+        log("ВЫУЧИЛ %s → через VPN (%s); список %s, закрыто соединений: %d"
+            % (h, detail, "подхвачен" if reloaded else "НЕ подхвачен mihomo", closed))
+    else:
+        log("%s: %s — %s" % (h, res, detail))
+    return res
+
+
+def recheck_one(via, only=None):
+    """Раз в неделю проверяет выученный сайт напрямую: прошёл дважды — убираем."""
+    t = now()
+    with locked():
+        st = load_state()
+        due = [(h, v) for h, v in st["hosts"].items()
+               if (only and h == only) or (not only and t - int(v.get("checked") or 0) >= RECHECK_AFTER)]
+        if not due or budget_left(st) <= 0:
+            return False
+        h, v = min(due, key=lambda x: int(x[1].get("checked") or 0))
+        st["probes"] += 1
+        save_state(st)
+    port = int(v.get("port") or 443)
+    ip = resolve(h, port) or v.get("ip") or ""
+    ok, detail = run_test(h, ip, port) if ip else (False, "имя не разрешается")
+    with locked():
+        st = load_state()
+        cur = st["hosts"].get(h)
+        if cur is None:
+            return True
+        cur["checked"] = now()
+        cur["ok"] = int(cur.get("ok") or 0) + 1 if ok else 0
+        gone = cur["ok"] >= 2
+        if gone:
+            st["hosts"].pop(h, None)
+            st["seen"][h] = {"res": "ok", "until": now() + COOLDOWN["ok"]}
+        save_state(st)
+        if gone:
+            write_list(st["hosts"])
+    if gone:
+        reload_list()
+        log("%s снова работает напрямую (%s) — убрал из списка" % (h, detail))
+    else:
+        log("перепроверка %s: %s — %s" % (h, "напрямую прошло" if ok else "напрямую всё ещё застревает", detail))
+    return True
+
+
+def scan():
+    why = gate()
+    if why:
+        return 0
+    os.makedirs(RUN, exist_ok=True)
+    with open(os.path.join(RUN, "scan.lock"), "a") as lf:
+        try:
+            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return 0
+        via, why = live_port()
+        if not via:
+            return 0
+        end = time.monotonic() + SCAN_FOR
+        hmap = load_map()
+        done = 0
+        rechecked = False
+        while time.monotonic() < end:
+            code, d = api("GET", "/connections")
+            if code != 200:
+                return 0
+            remember(hmap, (d or {}).get("connections") or [])
+            save_map(hmap)
+            st = load_state()
+            found = candidates(hmap, stuck_sockets(), st)
+            for h, ip, port, why in found:
+                if done >= PER_RUN or gate():
+                    break
+                if check_host(h, ip, port, why, via) is None:
+                    end = 0
+                    break
+                done += 1
+            if not found and not rechecked and done == 0:
+                rechecked = True
+                recheck_one(via)
+            time.sleep(SAMPLE_EVERY)
+    return 0
+
+
+# ---------------------------------------------------------------- prepare
+
+def split(s):
+    out, depth, cur = [], 0, []
+    for ch in s:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    out.append("".join(cur).strip())
+    return out
+
+
+def rule_target(rule):
+    parts = split(str(rule))
+    if parts[0].upper() == "MATCH":
+        return parts[1] if len(parts) > 1 else ""
+    return parts[2] if len(parts) >= 3 else ""
+
+
+def is_direct(target, groups, seen=()):
+    if target in ("DIRECT", "PASS", "COMPATIBLE"):
+        return True
+    g = groups.get(target)
+    if not g or target in seen:
+        return False
+    if any(g.get(k) for k in ("use", "include-all", "include-all-proxies", "include-all-providers")):
+        return False
+    ps = g.get("proxies") or []
+    return bool(ps) and all(is_direct(p, groups, seen + (target,)) for p in ps)
+
+
+def plan(cfg, settings):
+    """→ (группа VPN, порт входа, где ставить правило) или (None, причина)."""
+    rules = [str(r) for r in cfg.get("rules") or []]
+    groups = {g.get("name"): g for g in cfg.get("proxy-groups") or [] if isinstance(g, dict)}
+    names = set(groups) | {p.get("name") for p in cfg.get("proxies") or [] if isinstance(p, dict)}
+    last = split(rules[-1]) if rules else [""]
+    if last[0].upper() == "MATCH" and not is_direct(rule_target(rules[-1]), groups):
+        return None, "подписка и так ведёт незнакомые сайты через VPN"
+    group = settings.get("DPI_LEARN_GROUP", "")
+    if group and group not in names:
+        return None, "группы DPI_LEARN_GROUP «%s» нет в подписке" % group
+    if not group:
+        cnt = Counter()
+        for r in rules:
+            t = rule_target(r)
+            if t in groups and not is_direct(t, groups):
+                cnt[t] += 1
+        if not cnt:
+            return None, "в подписке нет группы VPN, куда вести сайты"
+        group = cnt.most_common(1)[0][0]
+    used = set()
+    for k in ("port", "socks-port", "mixed-port", "redir-port", "tproxy-port"):
+        try:
+            used.add(int(cfg.get(k) or 0))
+        except (TypeError, ValueError):
+            pass
+    for k in ("external-controller", "external-controller-tls"):
+        tail = str(cfg.get(k) or "").rsplit(":", 1)[-1]
+        if tail.isdigit():
+            used.add(int(tail))
+    for ln in cfg.get("listeners") or []:
+        if isinstance(ln, dict) and ln.get("name") != LISTENER:
+            try:
+                used.add(int(ln.get("port") or 0))
+            except (TypeError, ValueError):
+                pass
+    port = FIRST_PORT
+    while port in used:
+        port += 1
+    before_match = last[0].upper() == "MATCH"
+    return (group, port, before_match), ""
+
+
+def yq_json(path):
+    r = subprocess.run([YQ, "-o=json", ".", path], capture_output=True, text=True, timeout=60)
+    if r.returncode:
+        raise RuntimeError("yq: " + (r.stderr.strip() or path)[:150])
+    return json.loads(r.stdout or "null") or {}
+
+
+def prepare(path):
+    """Вставляет список, правило и вход в конфиг. Сбой — конфиг не трогаем."""
+    try:
+        cfg = yq_json(path)
+        res, reason = plan(cfg, read_env(SETTINGS))
+        with locked():
+            st = load_state()
+            write_list(st["hosts"])  # файл нужен до mihomo -t, даже пустой
+        if res is None:
+            set_env(False, reason)
+            print("сайты через VPN: выключено —", reason)
+            return 0
+        group, port, before = res
+        rule = "RULE-SET,%s,%s" % (PROVIDER, group)
+        ins = ".[:-1] + [strenv(DXK_RULE)] + .[-1:]" if before else ". + [strenv(DXK_RULE)]"
+        expr = (
+            '.["rule-providers"]["%s"] = {"type": "file", "behavior": "domain", "format": "text", '
+            '"path": "./dxk-learned.txt", "interval": 600} '
+            '| .rules = ((.rules // []) | map(select(test("^RULE-SET,%s,") | not))) '
+            '| .rules = (.rules | %s) '
+            '| .listeners = ((.listeners // []) | map(select(.name != "%s"))) + '
+            '[{"name": "%s", "type": "mixed", "port": env(DXK_PORT), "listen": "127.0.0.1", '
+            '"proxy": strenv(DXK_GROUP)}]'
+        ) % (PROVIDER, PROVIDER, ins, LISTENER, LISTENER)
+        env = dict(os.environ, DXK_RULE=rule, DXK_PORT=str(port), DXK_GROUP=group)
+        r = subprocess.run([YQ, "-i", expr, path], capture_output=True, text=True, timeout=60, env=env)
+        if r.returncode:
+            raise RuntimeError("yq: " + r.stderr.strip()[:150])
+        set_env(True, "", group, str(port))
+        print("сайты через VPN: правило перед MATCH → %s, проверки через 127.0.0.1:%d" % (group, port))
+        return 0
+    except Exception as e:  # любой сбой — конфиг без наших вставок, VPN работает как раньше
+        set_env(False, "не разобрал конфиг: %s: %s" % (type(e).__name__, str(e)[:150]))
+        print("сайты через VPN: не разобрал конфиг —", e)
+        return 1
+
+
+# ---------------------------------------------------------------- команды
+
+def cmd_remove(h):
+    h = valid_host(h)
+    if not h:
+        print("неверное имя")
+        return 2
+    with locked():
+        st = load_state()
+        was = st["hosts"].pop(h, None)
+        st["never"][h] = now()
+        st["seen"].pop(h, None)
+        save_state(st)
+        write_list(st["hosts"])
+    reload_list()
+    log("%s убран вручную и больше не добавляется" % h if was else "%s запрещён вручную" % h)
+    print("убрал" if was else "запомнил: не добавлять")
+    return 0
+
+
+def cmd_allow(h):
+    h = valid_host(h)
+    with locked():
+        st = load_state()
+        st["never"].pop(h, None)
+        st["seen"].pop(h, None)
+        save_state(st)
+    print("снова можно добавлять", h)
+    return 0
+
+
+def cmd_status():
+    env, st = read_env(ENVF), load_state()
+    print("включено:", "да" if env.get("LEARN_ON") == "1" else "нет — " + (env.get("LEARN_REASON") or "?"))
+    if read_env(SETTINGS).get("DPI_LEARN", "1") == "0":
+        print("поиск остановлен (DPI_LEARN=0), список продолжает работать")
+    print("группа:", env.get("LEARN_GROUP") or "—", " вход для проверок: 127.0.0.1:" + (env.get("LEARN_PORT") or "—"))
+    print("сайтов в списке: %d, запрещено вручную: %d, проверок сегодня: %s"
+          % (len(st["hosts"]), len(st["never"]), st.get("probes") if st.get("day") == time.strftime("%F") else 0))
+    for h, v in sorted(st["hosts"].items(), key=lambda x: -int(x[1].get("at") or 0)):
+        print("  %s  %s  %s" % (time.strftime("%F %H:%M", time.localtime(int(v.get("at") or 0))), h, v.get("why", "")))
+    return 0
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else ""
+    if cmd == "scan":
+        return scan()
+    if cmd == "prepare" and len(argv) == 3:
+        return prepare(argv[2])
+    if cmd == "off":
+        set_env(False, " ".join(argv[2:]) or "выключено")
+        return 0
+    if cmd == "probe" and len(argv) >= 3:
+        h = valid_host(argv[2])
+        port = int(argv[4]) if len(argv) > 4 else 443
+        ip = argv[3] if len(argv) > 3 else resolve(h, port)
+        via, why = live_port()
+        print("напрямую:", run_test(h, ip, port))
+        print("через VPN:", run_test(h, ip, port, via) if via else why)
+        return 0
+    if cmd == "list":
+        for h in sorted(load_state()["hosts"]):
+            print(h)
+        return 0
+    if cmd == "remove" and len(argv) == 3:
+        return cmd_remove(argv[2])
+    if cmd == "allow" and len(argv) == 3:
+        return cmd_allow(argv[2])
+    if cmd == "recheck":
+        via, why = live_port()
+        recheck_one(via, valid_host(argv[2]) if len(argv) > 2 else None)
+        return 0
+    if cmd == "status":
+        return cmd_status()
+    print(__doc__ or "dropweb-learn.py scan|prepare <config>|off|probe|list|remove|allow|recheck|status")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+EOF_LEARN
+}
+
 write_uninstall() {
 cat >/opt/sbin/mihomo-vpn-uninstall.sh <<'EOF_UNINSTALL'
 #!/opt/bin/sh
@@ -2002,7 +2959,7 @@ if [ -x /opt/etc/init.d/S96mihomo-panel ]; then /opt/etc/init.d/S96mihomo-panel 
 
 if [ -f "$CRONTAB" ]; then
   tmp="$CRONTAB.tmp.$$"
-  grep -vE '/opt/sbin/(update-mihomo-sub\.sh|update-dropweb-mihomo\.sh|mihomo-watchdog\.sh|dropweb-xkeen-update\.sh)' "$CRONTAB" >"$tmp"
+  grep -vE '/opt/sbin/(update-mihomo-sub\.sh|update-dropweb-mihomo\.sh|mihomo-watchdog\.sh|dropweb-xkeen-update\.sh|dropweb-learn\.py)' "$CRONTAB" >"$tmp"
   chmod 600 "$tmp" && mv "$tmp" "$CRONTAB"
 fi
 for c in /opt/etc/init.d/S05crond /opt/etc/init.d/S10cron; do
@@ -2012,12 +2969,14 @@ done
 rm -f /opt/etc/init.d/S96mihomo-panel /opt/etc/init.d/S97mihomo \
   /opt/sbin/update-mihomo-sub.sh /opt/sbin/mihomo-start.sh /opt/sbin/mihomo-resume.sh /opt/sbin/mihomo-panic.sh \
   /opt/sbin/mihomo-panel.py /opt/sbin/mihomo-watchdog.sh /opt/sbin/dropweb-xkeen-update.sh \
-  /opt/sbin/dropweb-udp-bypass.sh /opt/etc/ndm/netfilter.d/zz-dropweb-udp.sh \
-  /opt/etc/mihomo/config.yaml /opt/etc/mihomo/.sub.raw.yaml /opt/etc/mihomo/.config.new.yaml \
+  /opt/sbin/dropweb-udp-bypass.sh /opt/etc/ndm/netfilter.d/zz-dropweb-udp.sh /opt/sbin/dropweb-learn.py \
+  /opt/etc/mihomo/dxk-learned.txt /opt/etc/mihomo/config.yaml /opt/etc/mihomo/.sub.raw.yaml /opt/etc/mihomo/.config.new.yaml \
   /opt/etc/mihomo/.sub.headers \
   /opt/var/run/mihomo-panel.pid
 rm -rf /opt/etc/mihomo/zash /opt/backups/mihomo /opt/backups/dropweb-xkeen /opt/etc/dropweb-xkeen /opt/share/dropweb-xkeen
-rm -f /opt/var/log/mihomo-*.log /opt/var/log/dropweb-xkeen-update.log /opt/var/log/dropweb-udp-bypass.log
+rm -f /opt/var/log/mihomo-*.log /opt/var/log/dropweb-xkeen-update.log /opt/var/log/dropweb-udp-bypass.log \
+  /opt/var/log/dropweb-learn.log
+rm -rf /tmp/dxk-learn
 
 echo "Готово. XKeen и mihomo оставлены (автозапуск XKeen выключен). Удалить их полностью: xkeen -remove"
 rm -f "$0"
@@ -2033,10 +2992,11 @@ write_self_updater
 write_panel_init
 write_udp_bypass
 write_udp_hook
+write_learn
 write_uninstall
 chmod +x /opt/sbin/update-mihomo-sub.sh /opt/sbin/mihomo-watchdog.sh /opt/sbin/mihomo-panic.sh \
   /opt/sbin/mihomo-resume.sh /opt/etc/init.d/S96mihomo-panel \
-  /opt/sbin/mihomo-vpn-uninstall.sh "$SELF_UPDATER" "$UDP_BYPASS_SH" "$UDP_HOOK"
+  /opt/sbin/mihomo-vpn-uninstall.sh "$SELF_UPDATER" "$UDP_BYPASS_SH" "$UDP_HOOK" "$LEARN_PY"
 ok "Скрипты в /opt/sbin и /opt/etc/init.d/S96mihomo-panel"
 
 PANEL_FROM=""
@@ -2105,10 +3065,12 @@ case "$cron_min" in ''|*[!0-9]*) cron_min=13 ;; esac
 upd_min=$(( (cron_min + 30) % 60 ))
 upd_hour=$(( 3 + cron_min % 2 ))
 cron_tmp="$CRON_DIR/.root.tmp.$$"
-grep -vE '/opt/sbin/(update-mihomo-sub\.sh|update-dropweb-mihomo\.sh|mihomo-watchdog\.sh|dropweb-xkeen-update\.sh)' "$CRONTAB" >"$cron_tmp" || true
+grep -vE '/opt/sbin/(update-mihomo-sub\.sh|update-dropweb-mihomo\.sh|mihomo-watchdog\.sh|dropweb-xkeen-update\.sh|dropweb-learn\.py)' "$CRONTAB" >"$cron_tmp" || true
 {
   printf '%s * * * * /opt/sbin/update-mihomo-sub.sh\n' "$cron_min"
   printf '* * * * * /opt/sbin/mihomo-watchdog.sh\n'
+  # Поиск сайтов, которые режет провайдер: сам выходит, если DPI_LEARN=0.
+  printf '* * * * * %s scan\n' "$LEARN_PY"
   printf '%s %s * * * %s auto\n' "$upd_min" "$upd_hour" "$SELF_UPDATER"
 } >>"$cron_tmp"
 chmod 600 "$cron_tmp"
@@ -2268,6 +3230,23 @@ else
     ok "Игры и прочий UDP идут напрямую; в VPN — QUIC (порты $UDPB_PORTS) и звонки ($UDPB_V4 + $UDPB_V6 сетей)"
   else
     warn "Обход UDP не включился${UDPB_REASON:+: $UDPB_REASON} — весь UDP идёт через mihomo, как раньше"
+  fi
+
+  LEARN_ON=""; LEARN_REASON=""; LEARN_GROUP=""
+  if [ -f "$SETTINGS_DIR/learn.env" ]; then
+    # shellcheck source=/dev/null
+    . "$SETTINGS_DIR/learn.env"
+  fi
+  learn_n=$(grep -c . /opt/etc/mihomo/dxk-learned.txt 2>/dev/null || true)
+  if [ "$LEARN_ON" = 1 ] && [ "$DPI_LEARN" = 1 ]; then
+    ok "Сайты, которые провайдер режет напрямую, роутер находит сам и ведёт через «$LEARN_GROUP» (сейчас в списке: ${learn_n:-0})"
+  elif [ "$LEARN_ON" = 1 ]; then
+    ok "Найденные сайты (${learn_n:-0}) идут через «$LEARN_GROUP», новые не ищу (DPI_LEARN=0)"
+  else
+    case "$LEARN_REASON" in
+      "подписка и так"*) ok "Поиск сайтов, которые режет провайдер, не нужен: $LEARN_REASON" ;;
+      *) warn "Поиск сайтов, которые режет провайдер, не включился${LEARN_REASON:+: $LEARN_REASON}" ;;
+    esac
   fi
 fi
 
