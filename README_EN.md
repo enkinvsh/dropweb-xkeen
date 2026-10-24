@@ -10,6 +10,7 @@ A single script turns a Keenetic router with Entware into a **transparent VPN ro
 
 - **Transparent VPN for selected devices** via [XKeen 2](https://github.com/jameszeroX/XKeen) + **mihomo** (Clash.Meta) with dropweb routing rules: both TCP and UDP from devices in the policy are intercepted at the router
 - **Games without extra ping** — only the UDP the subscription can route to the VPN (QUIC, Telegram/WhatsApp/Discord/Meet calls) enters mihomo; games and other UDP go direct. The router builds the list from the subscription itself, see [Games and Calls (UDP)](#games-and-calls-udp)
+- **Sites your ISP cuts off are found automatically** — when a direct connection hangs mid-download, the router tests the site directly and through the VPN and, if the ISP is to blame, routes that site through the VPN. See [Sites Your ISP Cuts Off](#sites-your-isp-cuts-off)
 - **Web panel** at `http://192.168.1.1:8181/` — no SSH for daily use: VPN on/off, connection check, subscription expiry, "Update subscription", change the subscription link. When the subscription hits its device limit or expires, the panel says so and offers the one button that fixes it
 - **Zashboard UI** at `http://192.168.1.1:9090/ui/` — nodes, active connections, logs, latency checks. Protected by an API secret
 - **Hourly subscription sync** — full config diffing with hot reload via the mihomo API (zero connection drops when changed). If the primary subscription address is unreachable, the router falls back to the mirror addresses dropweb sends in the subscription itself
@@ -125,6 +126,30 @@ ssh root@192.168.1.1 /opt/sbin/dropweb-udp-bypass.sh status
 
 To send all UDP through mihomo: `UDP_BYPASS=0` in `/opt/etc/dropweb-xkeen/settings.env`, then `/opt/sbin/dropweb-udp-bypass.sh apply`.
 
+## Sites Your ISP Cuts Off
+
+Since 2025 the TSPU boxes at Russian ISPs cut connections to many foreign servers (Akamai, parts of AWS/CloudFront, Cloudflare, Hetzner and others): the first ~16 KB get through, then responses simply stop arriving, with no error. A page loads halfway, a download hangs, a game shows "Waiting for network connection". dropweb rules send unknown sites direct, and ready-made lists of such sites always lag behind.
+
+So the router finds them itself (`/opt/sbin/dropweb-learn.py`, cron every minute):
+
+1. It watches connections mihomo sends direct by the final `MATCH` rule, and the router's own sockets: data went out and no reply came, or the server went silent mid-response — that is a suspect.
+2. It tests the site itself, with the same test directly and through the VPN: a series of requests over one connection up to 40 KB, plus a 64 KB upload if the responses are small.
+3. Direct stalls, the VPN works, and a second direct test stalls again — the site goes into `/opt/etc/mihomo/dxk-learned.txt`. That list is wired in as `RULE-SET,dxk-learned,<VPN group>` right before `MATCH`; mihomo reloads it without a restart, and the router closes the stuck direct connections to the site so the app reconnects through the VPN.
+4. If the VPN does not work either, the site is simply down and is not added. Once a week the router retests found sites directly: two successes in a row and the site is removed from the list.
+
+The first stall still happens: it takes a couple of minutes from the hang to the switch, because the router waits until the server has definitely gone silent. At most three tests a minute and 150 a day, up to 500 sites in the list. The VPN group is the one the subscription sends sites to most often (for dropweb that is "🌍 VPN"); set another one in `DPI_LEARN_GROUP`. If the subscription already sends unknown sites through the VPN (`MATCH` is not `DIRECT`), the search is not needed and turns itself off.
+
+The panel lists found sites under "Sites via VPN": you can remove them there (a removed site is never added again) and turn the search for new ones off. The same over SSH:
+
+```sh
+ssh root@192.168.1.1 /opt/sbin/dropweb-learn.py status
+ssh root@192.168.1.1 /opt/sbin/dropweb-learn.py probe example.com    # test a site directly and through the VPN
+ssh root@192.168.1.1 /opt/sbin/dropweb-learn.py remove example.com   # remove and never add again
+ssh root@192.168.1.1 /opt/sbin/dropweb-learn.py allow example.com    # allow adding it again
+```
+
+Log: `/opt/var/log/dropweb-learn.log`. To stop looking for new sites: `DPI_LEARN=0` in `/opt/etc/dropweb-xkeen/settings.env` (sites already found keep going through the VPN).
+
 ## Post-Install Endpoints
 
 ```text
@@ -145,6 +170,7 @@ The API secret and all persisted settings live in `/opt/etc/dropweb-xkeen/settin
 - **Update subscription** — fetch it now instead of waiting for the hourly run
 - **Change subscription link** — paste a new link from the bot. The panel tests it first; a broken link leaves the old one in place
 - **Update** — installed version and whether a new one is out; "Update to …" now and an "Update automatically" switch (on by default)
+- **Sites via VPN** (panel label «Сайты через VPN») — sites the router moved to the VPN itself because the ISP kept cutting them off directly: when and why, a "Remove" button and a "Find them myself" switch
 
 When something is wrong with the subscription, an alert with a single action appears on top:
 
@@ -244,6 +270,9 @@ The router's HWID is printed in the error message and stored in `/opt/etc/dropwe
 | `/opt/sbin/dropweb-udp-bypass.sh` | UDP bypass: builds the VPN-bound address list from the subscription and adds a rule to the XKeen chain |
 | `/opt/etc/dropweb-xkeen/udp-bypass/` | Built lists and the build result (`state.env`) |
 | `/opt/etc/ndm/netfilter.d/zz-dropweb-udp.sh` | Restores the bypass rule after XKeen rebuilds iptables |
+| `/opt/sbin/dropweb-learn.py` | Finds sites the ISP cuts off (cron every minute) |
+| `/opt/etc/mihomo/dxk-learned.txt` | Found sites — the list behind `RULE-SET,dxk-learned` |
+| `/opt/etc/dropweb-xkeen/learn.json`, `learn.env` | When and why each site was found, sites removed by hand, outcome of the search setup |
 | `/opt/share/dropweb-xkeen/panel/` | Web panel: `mihomo-panel.py` (Python stdlib) and `index.html` |
 | `/opt/etc/init.d/S96mihomo-panel` | Web panel init script |
 | `/opt/sbin/mihomo-vpn-uninstall.sh` | Uninstaller |
@@ -270,7 +299,7 @@ ssh root@192.168.1.1 xkeen -remove
 - **`mixed-port` stays local to the router** (`allow-lan: false`) — no SOCKS/HTTP proxy is exposed on the LAN; the installer uses it locally to verify outbound connectivity.
 - **`find-process-mode: off`** — resolving local socket owners makes no sense for forwarded LAN traffic and wastes CPU on MIPS/ARM routers.
 - **Content-addressed subscription updates.** Every hour the subscription is fetched, patched, validated with `mihomo -t`, and compared against the active config. Only if the resulting config differs is a backup saved and hot-reloaded via the mihomo API. If fetching fails or returns a stub, the working config is untouched.
-- **Subscription mirrors come from the subscription headers.** dropweb sends `dropweb-sub-mirrors` and `fallback-url`; the updater remembers them and uses them when the primary address does not respond. The stored link itself is not changed.
+- **Subscription mirrors come from the subscription headers.** dropweb sends `dropweb-sub-mirrors` and `fallback-url`; the updater remembers them and uses them when the primary address does not respond. Reinstalling and updating dropweb-xkeen also fall back to the remembered mirrors when the ISP has blocked the primary address. The stored link itself is not changed.
 - **The panel explains instead of logging.** Every updater run records its outcome (`updated`, `unchanged`, `device_limit`, `fetch_failed`, …) in `sub-state.env`; the panel turns it into one sentence and one button.
 - **One version for everything, and rollback instead of hope.** The panel lives in its own files (`panel/`) so its look can change without touching the installer, but it updates together with the rest: the panel and the scripts on the router always come from the same commit. An update is a plain reinstall, and the snapshot taken before it brings everything back if the new version works worse.
 - **Deterministic HWID from LAN MAC.** Re-installs and upgrades reuse the same HWID so device slots are never leaked.
@@ -278,6 +307,7 @@ ssh root@192.168.1.1 xkeen -remove
 - **Fail-open by design (XKeen killswitch off).** If mihomo crashes, LAN devices fall back to direct internet access for up to a minute until the cron watchdog restarts mihomo, rather than bricking household connectivity.
 - **`geoipset` disabled** — all split-tunneling decisions happen inside mihomo using the subscription's rule providers rather than static iptables IP sets.
 - **The UDP bypass is derived from the rules, not configured by hand.** The only IP list in iptables is the one the router derives from the subscription config: dropweb changes rules in its template, routers pick them up with the next subscription update. The list errs on the side of inclusion (an extra address just means a packet goes through mihomo as before), and anything that cannot be parsed turns the bypass off entirely instead of letting traffic skip the rules.
+- **A site goes to the VPN only after a test, not on suspicion.** A stuck connection can mean anything: the server is down, the app holds an idle connection, the Wi-Fi is bad. So the router compares the same test directly and through the VPN and adds the site only if it stalls directly twice and works through the VPN. The list is separate from the subscription and sits right before `MATCH`, so dropweb rules always win.
 
 ## License
 
