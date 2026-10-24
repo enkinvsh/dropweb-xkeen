@@ -41,7 +41,7 @@
 
 set -eu
 
-DROPWEB_XKEEN_VERSION="2.4.0"
+DROPWEB_XKEEN_VERSION="2.4.1"
 SCRIPT_VERSION=$DROPWEB_XKEEN_VERSION
 
 # XKeen иначе уходит в фон и сразу возвращает 0 — нам нужен честный код возврата.
@@ -1493,11 +1493,13 @@ want_on() {
 }
 
 load_set() {
-  set=dxk_udp_vpn$1; lst=$DIR/v$1.lst; mark=/tmp/dxk-udp.set$1
+  # Имена переменных не пересекаются с apply_fam: в sh они общие, и прежнее
+  # mark затирало маркер правила — правило и набор пересоздавались каждую минуту.
+  set=dxk_udp_vpn$1; lst=$DIR/v$1.lst; smark=/tmp/dxk-udp.set$1
   fam=inet; [ "$1" = 6 ] && fam=inet6
   [ -f "$lst" ] || : >"$lst"
   sum=$(md5sum "$lst" | cut -d' ' -f1)
-  if ipset list -n "$set" >/dev/null 2>&1 && [ "$(cat "$mark" 2>/dev/null)" = "$sum" ]; then
+  if ipset list -n "$set" >/dev/null 2>&1 && [ "$(cat "$smark" 2>/dev/null)" = "$sum" ]; then
     return 0
   fi
   ipset create "$set" hash:net family "$fam" maxelem 262144 -exist || return 1
@@ -1508,7 +1510,7 @@ load_set() {
     return 1
   fi
   ipset swap "${set}_new" "$set" && ipset destroy "${set}_new"
-  echo "$sum" >"$mark"
+  echo "$sum" >"$smark"
 }
 
 # Аргументы правила: UDP не на адреса из набора и не на порты из списка — RETURN.
@@ -1529,7 +1531,7 @@ rule_args() {
 }
 
 apply_fam() {
-  ipt=$(ipt_of "$1"); mark=/tmp/dxk-udp.rule$1
+  ipt=$(ipt_of "$1"); rmark=/tmp/dxk-udp.rule$1
   command -v "$ipt" >/dev/null 2>&1 || return 0
   # Цепочки нет: VPN выключен или XKeen ещё не поднялся — потом вызовет хук.
   "$ipt" -w -t mangle -S xkeen 2>/dev/null | grep -q -- '-j TPROXY' || return 0
@@ -1537,16 +1539,16 @@ apply_fam() {
     if "$ipt" -w -t mangle -S xkeen 2>/dev/null | grep -q -- "$TAG"; then
       drop_rules "$ipt"; log "$ipt: обход UDP снят, весь UDP через mihomo"
     fi
-    rm -f "$mark"
+    rm -f "$rmark"
     return 0
   fi
   if ! load_set "$1"; then
     log "$ipt: набор dxk_udp_vpn$1 не загрузился — весь UDP через mihomo"
-    drop_rules "$ipt"; rm -f "$mark"
+    drop_rules "$ipt"; rm -f "$rmark"
     return 1
   fi
   args=$(rule_args "$1")
-  if "$ipt" -w -t mangle -S xkeen 2>/dev/null | grep -q -- "$TAG" && [ "$(cat "$mark" 2>/dev/null)" = "$args" ]; then
+  if "$ipt" -w -t mangle -S xkeen 2>/dev/null | grep -q -- "$TAG" && [ "$(cat "$rmark" 2>/dev/null)" = "$args" ]; then
     return 0
   fi
   drop_rules "$ipt"
@@ -1557,7 +1559,7 @@ apply_fam() {
   fi
   # shellcheck disable=SC2086 # args — список аргументов iptables
   if "$ipt" -w -t mangle -I xkeen "$pos" $args; then
-    printf '%s' "$args" >"$mark"
+    printf '%s' "$args" >"$rmark"
     flush_udp "$ipt"
     log "$ipt: обход UDP на месте (перед правилом $pos)"
   else
