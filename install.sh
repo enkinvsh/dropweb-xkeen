@@ -431,11 +431,33 @@ ok "Entware, curl, python3 на месте."
 # =============================================================================
 # Проверка подписки до установки XKeen
 # =============================================================================
+# fetch_sub <url> <повторы>
 fetch_sub() {
+  fs_url=$1; fs_retry=$2
   set -- -H "x-hwid: $HWID" -H "x-device-os: $DEVICE_OS"
   if [ -n "$OS_VERSION" ]; then set -- "$@" -H "x-ver-os: $OS_VERSION"; fi
   set -- "$@" -H "x-device-model: $DEVICE_MODEL" -A "$USER_AGENT_HDR"
-  curl -fsS --connect-timeout 15 --max-time 90 --retry 2 --retry-delay 5 "$@" -D "$PRECHECK_FILE.h" -o "$PRECHECK_FILE" "$SUB_URL"
+  rm -f "$PRECHECK_FILE" "$PRECHECK_FILE.h"
+  curl -fsS --connect-timeout 15 --max-time 90 --retry "$fs_retry" --retry-delay 5 "$@" -D "$PRECHECK_FILE.h" -o "$PRECHECK_FILE" "$fs_url"
+}
+
+# Зеркала, которые сервис прислал раньше для этой же ссылки (их помнит
+# update-mihomo-sub.sh). Основной домен провайдер может заблокировать: так
+# 2026-10-24 у Ростелекома dropweb.site перестал отвечать, часовое обновление
+# брало подписку с зеркала, а обновление dropweb-xkeen падало на этой проверке
+# и откатывалось.
+known_mirrors() {
+  [ -f /opt/etc/dropweb-xkeen/sub-state.env ] || return 0
+  (
+    SUB_STATE_URL=""; SUB_MIRRORS=""
+    # shellcheck source=/dev/null
+    . /opt/etc/dropweb-xkeen/sub-state.env
+    [ "$SUB_STATE_URL" = "$SUB_URL" ] || exit 0
+    for u in $(printf '%s' "$SUB_MIRRORS" | tr ',' ' '); do
+      [ "$u" != "$SUB_URL" ] || continue
+      case "$u" in https://*) printf '%s\n' "$u" ;; esac
+    done
+  )
 }
 
 # Значение заголовка ответа подписки (последнее, без учёта регистра имени).
@@ -444,7 +466,18 @@ precheck_hdr() {
 }
 
 inf "Проверяю подписку..."
-fetch_sub 2>>"$INSTALL_LOG" || die_log "Не скачалась подписка: проверь ссылку/интернет"
+if ! fetch_sub "$SUB_URL" 2 2>>"$INSTALL_LOG"; then
+  sub_ok=0
+  # Без повторов: заблокированное зеркало иначе съест по минуте.
+  for u in $(known_mirrors); do
+    if fetch_sub "$u" 0 2>>"$INSTALL_LOG"; then
+      sub_ok=1
+      warn "Основная ссылка не открылась, подписку отдало зеркало $(printf '%s' "$u" | cut -d/ -f3)"
+      break
+    fi
+  done
+  [ "$sub_ok" = 1 ] || die_log "Не скачалась подписка: проверь ссылку/интернет"
+fi
 if grep -qE 'Приложение не поддерживается|превысили лимит|лимит устройств|00000000-0000-0000-0000-000000000000' "$PRECHECK_FILE"; then
   # Панель dropweb кладёт в заголовок прямую ссылку на страницу устройств в кабинете.
   devices_url=$(precheck_hdr dropweb-device-remove)
